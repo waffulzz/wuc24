@@ -1,0 +1,21 @@
+/build/
+*.elf
+*.wps
+*.map
+*.lst
+cmdline
+
+# Console dumps and anything generated from them. These contain personal data
+# -- mail, addresses, friend codes, the message board -- and must never be
+# committed or shared.
+wuc24_*.bin
+wii_message_board.html
+/msgs/
+/sendmsgs/
+
+# Runtime logs. These record the console's mail address, Wii number and the
+# full task URLs, so they are personal data too.
+*.log
+
+__pycache__/
+*.pyc
