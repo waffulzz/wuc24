@@ -222,7 +222,7 @@ bool Send(const msgcfg::Config &cfg, const std::vector<std::string> &messages,
     parts.emplace_back("mlid", "mlid=" + MailId(cfg) + "\npasswd=" + cfg.password);
 
     for (size_t i = 0; i < messages.size(); i++) {
-        char name[8];
+        char name[16];
         std::snprintf(name, sizeof(name), "m%zu", i);
         parts.emplace_back(name, messages[i]);
     }
@@ -242,11 +242,11 @@ bool Send(const msgcfg::Config &cfg, const std::vector<std::string> &messages,
     // Per-message results. A missing cd<N> means the server raised no
     // objection to that one.
     for (size_t i = 0; i < messages.size(); i++) {
-        char key[8];
+        char key[16];
         std::snprintf(key, sizeof(key), "cd%zu", i);
         const std::string code = cgi.Get(key);
 
-        char msg_key[8];
+        char msg_key[16];
         std::snprintf(msg_key, sizeof(msg_key), "msg%zu", i);
 
         if (code.empty() || std::atoi(code.c_str()) == 100) {

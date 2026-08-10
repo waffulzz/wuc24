@@ -1,20 +1,18 @@
-// wuc24 — WiiConnect24-for-vWii downloader, as an Aroma (WUPS) plugin.
+// wuc24 — WiiConnect24 for the vWii, from Wii U mode.
 //
-// Goal: from Wii U (Cafe OS) mode, fetch WiiConnect24 content from WiiLink and
-// write it into the vWii NAND so the vWii channels have fresh data — without
-// booting into vWii.
+// WiiLink still serves WiiConnect24 content, but reaching it normally means
+// booting vWii and letting it sit there. This plugin does the job from Wii U
+// mode instead: it reads the console's own download list, fetches what each
+// channel is owed, and writes the results into the vWii NAND, so the channels
+// are current the next time you boot them. It handles mail in both directions
+// too, sending anything queued on the message board and delivering what is
+// waiting on the server.
 //
-// Milestone status (read the README for the full plan):
-//   [x] Plugin scaffold + config menu
-//   [x] vWii NAND (slccmpt) mount via libmocha + FSA
-//   [x] Read & summarise nwc24dl.bin download tasks   <-- current: read-only
-//   [ ] VFF read/write, HTTPS client, WC24 decode, NAND writes
-//
-// Right now the plugin is READ-ONLY: the "Scan" action mounts the vWii NAND and
-// dumps the download-task list to the log. Nothing is ever written to NAND yet.
-// "Fetch (test)" does a real HTTP GET of one live WC24 task and dumps the raw
-// bytes to SD -- no NAND writes, no decode. It's a connectivity/DNS probe and
-// the first real sample data for the WC24 decode work.
+// It runs on its own when the Wii U Menu starts, on a background thread, with a
+// toast for progress. Everything up to the moment of writing happens in memory,
+// and the writes themselves are journalled and verified, so being interrupted
+// -- by launching vWii, starting a game, or losing power -- does not leave a
+// channel's data half-written. See guard.h for how that is arranged.
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -116,110 +114,6 @@ static void RunScan() {
     LOG("=== scan done ===");
 }
 
-// Test target: entry [3] from a live scan -- WiiLink's Forecast Channel
-// subtask. Hardcoded here deliberately; this action exists to validate
-// DNS + plain-HTTP connectivity from Wii U mode, not to be a real feature.
-static constexpr char kTestFetchUrl[] = "http://fore.wiilink24.com///1/049/forecast.bin";
-static constexpr char kTestFetchOutFile[] = "wuc24_forecast_raw.bin";
-
-// Real HTTP GET of one live WC24 task, raw bytes dumped to SD. No NAND access.
-static void RunFetchTest() {
-    LOG("=== fetch test: %s ===", kTestFetchUrl);
-
-    net::Init();
-
-    std::vector<uint8_t> body;
-    int status = 0;
-    if (!net::HttpGet(kTestFetchUrl, body, status)) {
-        LOG("fetch test failed (no response parsed)");
-        return;
-    }
-
-    const char *mount = GetSdMountPath();
-    if (!mount) {
-        LOG("fetch test: SD not mounted, can't save %s", kTestFetchOutFile);
-        return;
-    }
-
-    char out_path[512];
-    std::snprintf(out_path, sizeof(out_path), "%s/%s", mount, kTestFetchOutFile);
-    FILE *f = std::fopen(out_path, "wb");
-    if (!f) {
-        LOG("fetch test: failed to open %s for writing", out_path);
-        return;
-    }
-    std::fwrite(body.data(), 1, body.size(), f);
-    std::fclose(f);
-
-    LOG("fetch test: HTTP %d, %zu bytes saved to %s", status, body.size(), out_path);
-    LOG("=== fetch test done ===");
-}
-
-// Same test target as RunFetchTest(): entry [3], Forecast Channel
-// (low_title_id=0x00010002, high_title_id="HAFE" -> 0x48414645).
-static constexpr char kTestVffPath[] = "/title/00010002/48414645/data/wc24dl.vff";
-static constexpr char kTestVffOutFile[] = "wuc24_forecast_vff_raw.bin";
-
-// Read-only: pull the real on-NAND VFF container for one channel and log its
-// header fields, to validate our VFF layout understanding against real data
-// before writing any FAT code. No NAND writes.
-static void RunDumpVff() {
-    LOG("=== dump vff: %s ===", kTestVffPath);
-    VwiiNand nand;
-    if (!nand.ok()) {
-        LOG("dump vff aborted: vWii NAND not available");
-        return;
-    }
-
-    std::vector<uint8_t> raw;
-    if (!nand.ReadFile(kTestVffPath, raw)) {
-        LOG("dump vff: could not read %s", kTestVffPath);
-        return;
-    }
-    LOG("dump vff: read %zu bytes", raw.size());
-
-    if (raw.size() >= sizeof(wc24::VffHeader)) {
-        wc24::VffHeader hdr;
-        std::memcpy(&hdr, raw.data(), sizeof(hdr));
-        LOG("  magic='%.4s' endian=0x%04X (big=0x%04X) volume_size=%u cluster_size_field=%u "
-            "(actual=%u) unknown_marker=0x%04X unknown=0x%04X",
-            hdr.magic, hdr.endianness, wc24::kVffEndianBig, hdr.volume_size,
-            hdr.cluster_size, hdr.cluster_size * 16, hdr.unknown_marker, hdr.unknown);
-    } else {
-        LOG("  file too small to hold a VffHeader (%zu < %zu)", raw.size(), sizeof(wc24::VffHeader));
-    }
-
-    const char *mount = GetSdMountPath();
-    if (!mount) {
-        LOG("dump vff: SD not mounted, can't save %s", kTestVffOutFile);
-        return;
-    }
-    char out_path[512];
-    std::snprintf(out_path, sizeof(out_path), "%s/%s", mount, kTestVffOutFile);
-    FILE *f = std::fopen(out_path, "wb");
-    if (!f) {
-        LOG("dump vff: failed to open %s for writing", out_path);
-        return;
-    }
-    std::fwrite(raw.data(), 1, raw.size(), f);
-    std::fclose(f);
-    LOG("dump vff: saved to %s", out_path);
-    LOG("=== dump vff done ===");
-}
-
-// Set by the "arm" config item. NAND writes refuse to run without it, so a
-// single stray toggle can never modify the console.
-static bool s_armed = false;
-
-// Resolve through WiiLink's DNS rather than the console's.
-//
-// OFF by default. The idea was that WiiLink's resolver redirects the dead
-// Nintendo hostnames still listed in nwc24dl.bin, but it does not answer
-// queries at all -- verified from three separate networks, including a control
-// lookup through 1.1.1.1 that succeeds from the same console. Stale hostnames
-// are handled by kHostOverrides instead, which is also what WiiLink's own
-// patchers do. Left as an option in case the server comes back.
-static bool s_useWiiLinkDns = false;
 
 // Where a container's pre-modification backup lands on SD.
 static std::string BackupNameFor(const DlTaskInfo &task) {
@@ -417,11 +311,6 @@ static void RestoreContainer(VwiiNand &nand, const ContainerJob &job) {
 static void RunPipeline(bool commit) {
     const char *mode = commit ? "COMMIT" : "dry run";
     LOG("=== %s ===", mode);
-
-    if (commit && !s_armed && !autorun::Running()) {
-        LOG("refusing to write: enable \"Arm NAND write\" first");
-        return;
-    }
 
     VwiiNand nand;
     if (!nand.ok()) {
@@ -680,67 +569,6 @@ static void RunMailConfig() {
     LOG("=== mail config done ===");
 }
 
-// Writes a synthetic message into the inbox, to prove the format is right
-// before any of it depends on talking to a server. Backs the inbox up first
-// and refuses without arming.
-static void RunInjectTestMail(bool commit) {
-    LOG("=== inject test mail (%s) ===", commit ? "COMMIT" : "dry run");
-
-    if (commit && !s_armed) {
-        LOG("refusing to write: enable \"Arm NAND write\" first");
-        return;
-    }
-
-    VwiiNand nand;
-    if (!nand.ok()) {
-        LOG("aborted: vWii NAND not available");
-        return;
-    }
-
-    msgcfg::Config cfg;
-    if (!msgcfg::Read(nand, cfg) || cfg.WiiAddress().empty()) {
-        LOG("aborted: could not determine this console's mail address");
-        return;
-    }
-    LOG("delivering to %s", cfg.WiiAddress().c_str());
-
-    // Back the inbox up before touching it -- both halves, since a half-written
-    // pair is the one state that would be awkward to recover from.
-    std::vector<uint8_t> backup;
-    if (!nand.ReadFile(wc24::kWc24RecvCtl, backup) ||
-        !SaveToSd("wuc24_bak_recv_ctl.bin", backup.data(), backup.size())) {
-        LOG("aborted: could not back up the inbox index");
-        return;
-    }
-    if (!nand.ReadFile(wc24::kWc24RecvMbx, backup) ||
-        !SaveToSd("wuc24_bak_recv_mbx.bin", backup.data(), backup.size())) {
-        LOG("aborted: could not back up the inbox mailbox");
-        return;
-    }
-    backup.clear();
-    backup.shrink_to_fit();
-
-    mail::Message msg;
-    msg.from     = "w0000000000000000@rc24.xyz";
-    msg.to       = cfg.WiiAddress();
-    msg.subject  = "Wii Message";
-    msg.alt_name = "wuc24";
-    msg.body =
-        "Hello from wuc24.\n\n"
-        "This message was written straight into the vWii inbox\n"
-        "from Wii U mode. If you can read it on the message\n"
-        "board, the mail format is correct.\n";
-
-    if (!mail::Deliver(nand, msg, commit)) {
-        LOG("delivery failed -- backups are on SD as wuc24_bak_recv_*.bin");
-        return;
-    }
-
-    if (commit) {
-        LOG("written. Boot vWii and look at the message board.");
-    }
-    LOG("=== inject test mail done ===");
-}
 
 // Read-only: ask the mail server whether anything is waiting. Consumes
 // nothing, so it can be run as often as you like.
@@ -775,12 +603,6 @@ static void RunMailCheck() {
 // dry run, which still consumes them.
 static void RunFetchMail(bool commit) {
     LOG("=== fetch mail (%s) ===", commit ? "COMMIT" : "dry run");
-
-    if (!s_armed && !autorun::Running()) {
-        LOG("refusing: enable \"Arm NAND write\" first.");
-        LOG("note: fetching consumes mail server-side even without writing.");
-        return;
-    }
 
     VwiiNand nand;
     if (!nand.ok()) {
@@ -858,11 +680,6 @@ static void RunFetchMail(bool commit) {
 // failure leaves them queued for the console to send later.
 static void RunSendMail(bool commit) {
     LOG("=== send mail (%s) ===", commit ? "COMMIT" : "dry run");
-
-    if (commit && !s_armed && !autorun::Running()) {
-        LOG("refusing to write: enable \"Arm NAND write\" first");
-        return;
-    }
 
     VwiiNand nand;
     if (!nand.ok()) {
@@ -955,116 +772,7 @@ static void RunSendMail(bool commit) {
     LOG("=== send mail done ===");
 }
 
-// Minimal write test for the inbox index.
-//
-// Injecting a message and finding the file reverted afterwards has two very
-// different explanations: the Wii Menu rejected our entry, or something
-// restores /shared2/wc24 wholesale regardless of what we put there. This
-// changes ONE inert counter -- no entries, no message, nothing to validate --
-// so if even that does not survive a vWii boot, entry correctness is not the
-// problem and Route A is dead on this hardware.
-static void RunMailProbe() {
-    LOG("=== mail probe ===");
 
-    VwiiNand nand;
-    if (!nand.ok()) {
-        LOG("aborted: vWii NAND not available");
-        return;
-    }
-
-    std::vector<uint8_t> ctl;
-    if (!nand.ReadFile(wc24::kWc24RecvCtl, ctl) || ctl.size() < sizeof(wc24::MailListHeader)) {
-        LOG("aborted: cannot read the inbox index");
-        return;
-    }
-
-    wc24::MailListHeader header;
-    std::memcpy(&header, ctl.data(), sizeof(header));
-    if (header.magic != wc24::kMailListMagic) {
-        LOG("aborted: bad magic 0x%08X", header.magic);
-        return;
-    }
-
-    const uint32_t before = header.next_entry_id;
-
-    // Always report first: unarmed, this is a read-only way to see whether a
-    // previous bump survived a trip through vWii.
-    LOG("inbox now reads: next_entry_id=%u number_of_mail=%u next_entry_offset=%u", before,
-        header.number_of_mail, header.next_entry_offset);
-
-    if (!s_armed) {
-        LOG("not armed -- reporting only, nothing written.");
-        LOG("=== mail probe done ===");
-        return;
-    }
-
-    if (!SaveToSd("wuc24_bak_recv_ctl.bin", ctl.data(), ctl.size())) {
-        LOG("aborted: could not back it up");
-        return;
-    }
-
-    header.next_entry_id  = before + 1;
-    std::memcpy(ctl.data(), &header, sizeof(header));
-
-    if (!nand.WriteFile(wc24::kWc24RecvCtl, ctl.data(), static_cast<uint32_t>(ctl.size()))) {
-        LOG("write FAILED");
-        return;
-    }
-
-    std::vector<uint8_t> check;
-    if (!nand.ReadFile(wc24::kWc24RecvCtl, check)) {
-        LOG("cannot read back");
-        return;
-    }
-    wc24::MailListHeader after;
-    std::memcpy(&after, check.data(), sizeof(after));
-
-    LOG("next_entry_id %u -> %u, reads back as %u  [%s]", before, before + 1, after.next_entry_id,
-        after.next_entry_id == before + 1 ? "PERSISTED" : "NOT PERSISTED");
-    LOG("Now boot vWii, come back, and run this again WITHOUT arming --");
-    LOG("if it reads %u again, the console reverted the file.", before);
-    LOG("=== mail probe done ===");
-}
-
-// Read-only: list the places a received message could be living.
-//
-// /shared2/wc24/mbox is only a transit box -- KD downloads into it and the Wii
-// Menu then moves messages into its own storage and clears it, which is why a
-// message visible on the console does not appear there. This walks the likely
-// locations so the real message store can be found rather than guessed at.
-static void RunExplore() {
-    LOG("=== explore NAND (read-only) ===");
-
-    VwiiNand nand;
-    if (!nand.ok()) {
-        LOG("explore aborted: vWii NAND not available");
-        return;
-    }
-
-    const char *paths[] = {
-        "/shared2/wc24",
-        "/shared2/wc24/mbox",
-        "/title/00000001/00000002/data",     // Wii Menu
-        "/title/00000001/00000002/content",
-        "/shared2",
-        "/title/00010002/48414541/data",     // HAEA -- the mail/board task's title
-    };
-
-    for (const char *path : paths) {
-        std::vector<VwiiNand::DirEntry> entries;
-        if (!nand.ListDir(path, entries)) {
-            LOG("--- %s : cannot list ---", path);
-            continue;
-        }
-        LOG("--- %s (%zu entries) ---", path, entries.size());
-        for (const auto &e : entries) {
-            LOG("    %-24s %10u %s%s", e.name.c_str(), e.size, e.is_dir ? "<dir>" : "     ",
-                e.encrypted ? "  [encrypted]" : "");
-        }
-    }
-
-    LOG("=== explore done ===");
-}
 
 // Read-only: dump the mail boxes so the receive-side format can be worked out
 // against real data. Dolphin implements sending only and explicitly does not
@@ -1212,221 +920,12 @@ static void RunDumpMail() {
     LOG("=== dump mail done ===");
 }
 
-// Read-only: resolve every hostname in the task list both through the
-// configured DNS and through the console's own resolver, and show them side by
-// side. This is the only way to see the legacy Nintendo hostnames, since the
-// tasks using them are all mail or encrypted and so never reach a download.
-// If WiiLink's DNS is doing its job, those rows resolve to a WiiLink address
-// via custom DNS and to a dead Nintendo/Akamai/AWS address via the system one.
-static void RunDnsTest() {
-    LOG("=== DNS test (read-only) ===");
 
-    VwiiNand nand;
-    if (!nand.ok()) {
-        LOG("dns test aborted: vWii NAND not available");
-        return;
-    }
 
-    std::vector<DlTaskInfo> tasks;
-    if (!ScanDlTasks(nand, tasks)) {
-        LOG("dns test aborted: could not read the task list");
-        return;
-    }
-
-    net::Init();
-
-    // Control first: if our DNS client can talk to a known-good public
-    // resolver but not to WiiLink's, the client is fine and the problem is
-    // WiiLink's server or the network path to it. If BOTH fail, the fault is
-    // on our side.
-    std::string control_ip;
-    const bool  control_ok =
-        net::ResolveVia(net::kControlDns, "example.com", control_ip);
-    LOG("control: example.com via %s -> %s  [%s]", net::kControlDns, control_ip.c_str(),
-        control_ok ? "DNS CLIENT WORKS" : "DNS CLIENT NOT WORKING");
-
-    std::string wiilink_ip;
-    const bool  wiilink_ok =
-        net::ResolveVia(net::kWiiLinkDns, "example.com", wiilink_ip);
-    LOG("control: example.com via %s -> %s  [%s]", net::kWiiLinkDns, wiilink_ip.c_str(),
-        wiilink_ok ? "WIILINK DNS ANSWERS" : "WIILINK DNS SILENT");
-
-    if (control_ok && !wiilink_ok) {
-        LOG("=> our DNS client is fine; WiiLink's resolver is not reachable from here.");
-        LOG("   (some routers/ISPs block outbound port 53 to anything but their own)");
-    } else if (!control_ok) {
-        LOG("=> no DNS server answered at all -- likely a fault in the plugin or blocked UDP/53.");
-    }
-
-    std::vector<std::string> seen;
-    LOG("%-42s %-16s %-16s", "host", "wiilink dns", "console dns");
-    for (const auto &t : tasks) {
-        const std::string host = net::HostOf(t.url);
-        if (host.empty()) continue;
-
-        bool already = false;
-        for (const auto &h : seen) {
-            if (h == host) already = true;
-        }
-        if (already) continue;
-        seen.push_back(host);
-
-        std::string via_custom, via_system;
-        net::ResolveVia(net::kWiiLinkDns, host, via_custom);
-        net::ResolveViaSystem(host, via_system);
-        LOG("%-42s %-16s %-16s%s", host.c_str(), via_custom.c_str(), via_system.c_str(),
-            (via_custom != via_system && via_custom != "-") ? "  <- redirected" : "");
-    }
-
-    LOG("=== dns test done ===");
-}
-
-// Read-only probe: for every eligible task, ask the server for the plain URL
-// and then for numbered subtask variants (url.00, url.01, ...). KD fans a
-// single list entry out into several numbered downloads for some channels, and
-// this reports which ones actually exist rather than guessing at the encoding
-// of subtask_bitmask. Stops after two consecutive misses. Touches nothing.
-static void RunProbeSubtasks() {
-    LOG("=== probe subtask URLs (read-only) ===");
-
-    VwiiNand nand;
-    if (!nand.ok()) {
-        LOG("probe aborted: vWii NAND not available");
-        return;
-    }
-
-    std::vector<DlTaskInfo> tasks;
-    if (!ScanDlTasks(nand, tasks)) {
-        LOG("probe aborted: could not read the task list");
-        return;
-    }
-
-    net::Init();
-
-    for (const auto &t : tasks) {
-        const char *why_not = nullptr;
-        if (!IsEligible(t, &why_not)) continue;
-
-        LOG("--- [%u] %s (file '%s', sub_type=%u sub_bitmask=0x%08X)", t.index, t.url.c_str(),
-            t.filename.c_str(), t.subtask_type, t.subtask_bitmask);
-
-        std::vector<uint8_t> body;
-        int status = 0;
-        if (net::HttpGet(t.url, body, status)) {
-            LOG("    plain        -> HTTP %d, %zu bytes", status, body.size());
-        } else {
-            LOG("    plain        -> request failed");
-        }
-
-        int misses = 0;
-        for (int i = 0; i < 8 && misses < 2; i++) {
-            char suffixed[512];
-            std::snprintf(suffixed, sizeof(suffixed), "%s.%02d", t.url.c_str(), i);
-
-            std::vector<uint8_t> sub_body;
-            int sub_status = 0;
-            if (net::HttpGet(suffixed, sub_body, sub_status) && sub_status == 200) {
-                LOG("    .%02d          -> HTTP 200, %zu bytes", i, sub_body.size());
-                misses = 0;
-            } else {
-                LOG("    .%02d          -> HTTP %d", i, sub_status);
-                misses++;
-            }
-        }
-    }
-
-    LOG("=== probe done ===");
-}
-
-// Deletes the downloaded files from every container we would otherwise write
-// to, so a channel has no WC24 data at all. Used to tell "the channel is
-// showing data we wrote" apart from "the channel downloaded it itself".
-static void RunClear() {
-    LOG("=== CLEAR WC24 data ===");
-
-    if (!s_armed) {
-        LOG("refusing to write: enable \"Arm NAND write\" first");
-        return;
-    }
-
-    VwiiNand nand;
-    if (!nand.ok()) {
-        LOG("clear aborted: vWii NAND not available");
-        return;
-    }
-
-    std::vector<DlTaskInfo> tasks;
-    if (!ScanDlTasks(nand, tasks)) {
-        LOG("clear aborted: could not read the task list");
-        return;
-    }
-
-    std::vector<ContainerJob> jobs;
-    BuildJobs(tasks, jobs, false);
-
-    for (const auto &job : jobs) {
-        LOG("--- %s (%zu file(s)) ---", job.vff_path.c_str(), job.units.size());
-
-        std::vector<uint8_t> buffer;
-        if (!nand.ReadFile(job.vff_path.c_str(), buffer)) {
-            LOG("  could not read the container -- skipped");
-            continue;
-        }
-        if (!SaveToSd(job.backup_name.c_str(), buffer.data(), buffer.size())) {
-            LOG("  refusing to continue without a backup on SD -- skipped");
-            continue;
-        }
-
-        bool ok = true;
-        {
-            vff::Image image(buffer);
-            if (!image.ok()) {
-                LOG("  could not mount the container -- skipped");
-                continue;
-            }
-            for (const auto &unit : job.units) {
-                if (!image.DeleteFile(unit.filename.c_str())) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (ok) {
-                LOG("  deleted %zu file(s)", job.units.size());
-                std::vector<vff::Image::Entry> entries;
-                if (image.List(entries)) {
-                    LOG("  container now holds:");
-                    for (const auto &e : entries) {
-                        LOG("      %-16s %8u %s", e.name.c_str(), e.size,
-                            e.is_dir ? "<dir>" : "");
-                    }
-                }
-            }
-        }
-        if (!ok) {
-            LOG("  container left untouched");
-            continue;
-        }
-
-        if (!nand.WriteFile(job.vff_path.c_str(), buffer.data(),
-                            static_cast<uint32_t>(buffer.size()))) {
-            LOG("  WRITE FAILED -- restoring the original");
-            RestoreContainer(nand, job);
-            continue;
-        }
-        LOG("  cleared (backup: %s)", job.backup_name.c_str());
-    }
-
-    LOG("=== clear done ===");
-}
 
 // Puts back whatever BackupNameFor() last saved for each container.
 static void RunRestore() {
     LOG("=== RESTORE from SD backups ===");
-
-    if (!s_armed) {
-        LOG("refusing to write: enable \"Arm NAND write\" first");
-        return;
-    }
 
     if (!GetSdMountPath()) {
         LOG("restore aborted: SD not mounted");
@@ -1545,29 +1044,8 @@ static void AutorunJob() {
 
 // A boolean toggled to ON triggers a one-shot action, then we reset it so it
 // reads as a momentary "button". WUPS fires the callback when the menu closes.
-static void OnScanToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("Scan", [] { RunScan(); });
-    }
-}
 
-static void OnFetchTestToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("FetchTest", [] { RunFetchTest(); });
-    }
-}
 
-static void OnDumpVffToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("DumpVff", [] { RunDumpVff(); });
-    }
-}
-
-static void OnDryRunToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("DryRun", [] { RunPipeline(false); });
-    }
-}
 
 // Persisted, unlike the action toggles: arming is meant to be a deliberate
 // separate step from triggering the write.
@@ -1582,21 +1060,36 @@ static void OnAutoMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     WUPSStorageAPI::Store("automail", s_autoMail);
 }
 
-static void OnArmToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    s_armed = newValue;
-    WUPSStorageAPI::Store("armed", s_armed);
-    LOG("NAND write %s", s_armed ? "ARMED" : "disarmed");
+
+
+
+
+
+
+
+
+
+
+// One-shot actions run on the same background thread as the automatic job, so
+// closing the menu never leaves the console waiting on a download.
+static void OnRunNowToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    if (!newValue) return;
+    if (autorun::Running()) {
+        toast::Info("WiiConnect24: already running");
+        return;
+    }
+    autorun::Start(&AutorunJob);
 }
 
-static void OnWiiLinkDnsToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    s_useWiiLinkDns = newValue;
-    WUPSStorageAPI::Store("wiilink_dns", s_useWiiLinkDns);
-    net::SetDnsServer(s_useWiiLinkDns ? net::kWiiLinkDns : nullptr);
-}
-
-static void OnCommitToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+static void OnRestoreToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     if (newValue) {
-        RunGuarded("Commit", [] { RunPipeline(true); });
+        RunGuarded("Restore", [] { RunRestore(); });
+    }
+}
+
+static void OnScanToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    if (newValue) {
+        RunGuarded("Scan", [] { RunScan(); });
     }
 }
 
@@ -1606,51 +1099,9 @@ static void OnMailCheckToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     }
 }
 
-static void OnFetchMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("FetchMail", [] { RunFetchMail(true); });
-    }
-}
-
-static void OnSendMailDryToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("SendMailDry", [] { RunSendMail(false); });
-    }
-}
-
-static void OnSendMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("SendMail", [] { RunSendMail(true); });
-    }
-}
-
-static void OnMailProbeToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("MailProbe", [] { RunMailProbe(); });
-    }
-}
-
 static void OnMailConfigToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     if (newValue) {
         RunGuarded("MailConfig", [] { RunMailConfig(); });
-    }
-}
-
-static void OnInjectDryToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("InjectDry", [] { RunInjectTestMail(false); });
-    }
-}
-
-static void OnInjectToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("Inject", [] { RunInjectTestMail(true); });
-    }
-}
-
-static void OnExploreToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("Explore", [] { RunExplore(); });
     }
 }
 
@@ -1660,102 +1111,34 @@ static void OnDumpMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     }
 }
 
-static void OnDnsTestToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("DnsTest", [] { RunDnsTest(); });
-    }
-}
-
-static void OnProbeToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("Probe", [] { RunProbeSubtasks(); });
-    }
-}
-
-static void OnClearToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("Clear", [] { RunClear(); });
-    }
-}
-
-static void OnRestoreToggled(ConfigItemBoolean * /*item*/, bool newValue) {
-    if (newValue) {
-        RunGuarded("Restore", [] { RunRestore(); });
-    }
-}
-
 static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHandle root) {
-    // The automatic behaviour comes first: it is what most people want, and
-    // everything below it is a manual tool.
+    // What the plugin is for comes first; everything else is a tool.
     WUPSConfigItemBoolean_AddToCategory(
-        root, "autorun", "Update automatically at boot (writes to vWii NAND)",
-        false, s_autorun, &OnAutorunToggled);
+        root, "autorun", "Update at boot", false, s_autorun, &OnAutorunToggled);
     WUPSConfigItemBoolean_AddToCategory(
-        root, "automail", "  ...including sending and receiving mail",
-        true, s_autoMail, &OnAutoMailToggled);
+        root, "automail", "Include mail (send and receive)", true, s_autoMail,
+        &OnAutoMailToggled);
     WUPSConfigItemBoolean_AddToCategory(
-        root, "scan", "Scan vWii WC24 tasks (read-only) — toggle ON + close menu",
-        false, false, &OnScanToggled);
+        root, "run_now", "Update now", false, false, &OnRunNowToggled);
     WUPSConfigItemBoolean_AddToCategory(
-        root, "fetch_test", "Fetch test: forecast.bin -> SD (no NAND write) — toggle ON + close menu",
-        false, false, &OnFetchTestToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "dump_vff", "Dump vWii Forecast VFF (read-only) -> SD — toggle ON + close menu",
-        false, false, &OnDumpVffToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "wiilink_dns", "Resolve via WiiLink DNS (167.235.229.36) — currently unresponsive",
-        false, s_useWiiLinkDns, &OnWiiLinkDnsToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "mail_check", "MAIL CHECK: is mail waiting on the server? (read-only)",
-        false, false, &OnMailCheckToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "mail_cfg", "MAIL CONFIG: show this console's mail identity (read-only)",
-        false, false, &OnMailConfigToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "inject_dry", "TEST MAIL (dry run): build an inbox message, no NAND write",
-        false, false, &OnInjectDryToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "explore", "EXPLORE: list NAND dirs to find the message store (read-only)",
-        false, false, &OnExploreToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "dump_mail", "DUMP MAIL: copy the WC24 mailboxes to SD (read-only)",
-        false, false, &OnDumpMailToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "dns_test", "DNS TEST: resolve every task host, both ways (read-only)",
-        false, false, &OnDnsTestToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "probe", "PROBE: which subtask URLs exist on the servers (read-only)",
-        false, false, &OnProbeToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "dry_run", "DRY RUN: download + update all containers -> SD only (no NAND write)",
-        false, false, &OnDryRunToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "armed", "Arm NAND write (required by the manual write actions)",
-        false, s_armed, &OnArmToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "commit", "COMMIT: download + write all containers to vWii NAND",
-        false, false, &OnCommitToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "clear", "CLEAR: delete WC24 data from the containers (for testing)",
-        false, false, &OnClearToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "send_dry", "SEND MAIL (dry run): list the outbox, no network at all",
-        false, false, &OnSendMailDryToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "send_mail", "SEND MAIL: send queued outbox mail (needs arming)",
-        false, false, &OnSendMailToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "fetch_mail", "FETCH MAIL: download waiting mail into the inbox (needs arming)",
-        false, false, &OnFetchMailToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "mail_probe", "MAIL PROBE: bump one inbox counter (needs arming)",
-        false, false, &OnMailProbeToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "inject", "TEST MAIL: write a message into the vWii inbox (needs arming)",
-        false, false, &OnInjectToggled);
-    WUPSConfigItemBoolean_AddToCategory(
-        root, "restore", "RESTORE: put the SD backups back onto NAND",
-        false, false, &OnRestoreToggled);
+        root, "restore", "Restore from SD backups", false, false, &OnRestoreToggled);
+
+    // Read-only tools, tucked away. They exist so that "it did not work" can be
+    // answered with evidence rather than guesswork.
+    WUPSConfigCategoryHandle diagnostics;
+    WUPSConfigAPICreateCategoryOptionsV1 options = {.name = "Diagnostics"};
+    if (WUPSConfigAPI_Category_Create(options, &diagnostics) == WUPSCONFIG_API_RESULT_SUCCESS) {
+        WUPSConfigItemBoolean_AddToCategory(
+            diagnostics, "scan", "List WiiConnect24 tasks", false, false, &OnScanToggled);
+        WUPSConfigItemBoolean_AddToCategory(
+            diagnostics, "mail_check", "Is mail waiting?", false, false, &OnMailCheckToggled);
+        WUPSConfigItemBoolean_AddToCategory(
+            diagnostics, "mail_cfg", "Show mail identity", false, false, &OnMailConfigToggled);
+        WUPSConfigItemBoolean_AddToCategory(
+            diagnostics, "dump_mail", "Copy mailboxes to SD", false, false, &OnDumpMailToggled);
+        WUPSConfigAPI_Category_AddCategory(root, diagnostics);
+    }
+
     return WUPSCONFIG_API_CALLBACK_RESULT_SUCCESS;
 }
 
@@ -1771,11 +1154,12 @@ INITIALIZE_PLUGIN() {
     LogInit();
     net::Init();
 
-    WUPSStorageAPI::GetOrStoreDefault("armed", s_armed, false);
     WUPSStorageAPI::GetOrStoreDefault("autorun", s_autorun, false);
     WUPSStorageAPI::GetOrStoreDefault("automail", s_autoMail, true);
-    WUPSStorageAPI::GetOrStoreDefault("wiilink_dns", s_useWiiLinkDns, false);
-    net::SetDnsServer(s_useWiiLinkDns ? net::kWiiLinkDns : nullptr);
+
+    // The console's own resolver handles every host we actually use; stale
+    // Nintendo hostnames are dealt with by kHostOverrides instead.
+    net::SetDnsServer(nullptr);
 
     WUPSConfigAPIOptionsV1 options = {.name = "wuc24"};
     if (WUPSConfigAPI_Init(options, ConfigMenuOpenedCallback, ConfigMenuClosedCallback) !=
