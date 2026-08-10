@@ -45,6 +45,15 @@ std::string FormatDate(uint32_t minutes_since_1900);
 std::string BuildMessage(const Message &msg, uint32_t id, uint64_t friend_code,
                          uint32_t minutes_since_1900, FieldSpans &spans);
 
+// Works out the same spans for a message we did NOT build -- one fetched from
+// the mail server, which already arrives in the form the console stores. Those
+// are written verbatim rather than regenerated, so the entry has to describe
+// whatever the server actually sent.
+bool AnalyseMessage(const std::string &text, FieldSpans &spans);
+
+// Stores an already-formed message in the inbox and indexes it.
+bool DeliverRaw(VwiiNand &nand, const std::string &text, bool commit);
+
 // Reads the inbox, appends `msg`, and writes it back. Backs both files up to
 // SD first via the caller-supplied callback, and leaves NAND untouched unless
 // every step succeeds.

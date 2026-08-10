@@ -26,6 +26,7 @@
 
 #include "log.h"
 #include "mail.h"
+#include "mailfetch.h"
 #include "msgcfg.h"
 #include "nand.h"
 #include "net.h"
@@ -696,6 +697,114 @@ static void RunInjectTestMail(bool commit) {
     LOG("=== inject test mail done ===");
 }
 
+// Read-only: ask the mail server whether anything is waiting. Consumes
+// nothing, so it can be run as often as you like.
+static void RunMailCheck() {
+    LOG("=== mail check ===");
+
+    VwiiNand nand;
+    if (!nand.ok()) {
+        LOG("aborted: vWii NAND not available");
+        return;
+    }
+    msgcfg::Config cfg;
+    if (!msgcfg::Read(nand, cfg)) {
+        LOG("aborted: cannot read the mail config");
+        return;
+    }
+
+    net::Init();
+    mailfetch::CheckResult result;
+    if (!mailfetch::Check(cfg, result)) {
+        LOG("check failed");
+        return;
+    }
+    LOG("=== mail check done ===");
+}
+
+// Downloads waiting mail and puts it in the inbox.
+//
+// This is the one action that cannot be undone from here: the server marks
+// messages delivered as it sends them, so once fetched they will never arrive
+// through the console's own route. Hence the arming requirement even for the
+// dry run, which still consumes them.
+static void RunFetchMail(bool commit) {
+    LOG("=== fetch mail (%s) ===", commit ? "COMMIT" : "dry run");
+
+    if (!s_armed) {
+        LOG("refusing: enable \"Arm NAND write\" first.");
+        LOG("note: fetching consumes mail server-side even without writing.");
+        return;
+    }
+
+    VwiiNand nand;
+    if (!nand.ok()) {
+        LOG("aborted: vWii NAND not available");
+        return;
+    }
+    msgcfg::Config cfg;
+    if (!msgcfg::Read(nand, cfg)) {
+        LOG("aborted: cannot read the mail config");
+        return;
+    }
+
+    net::Init();
+
+    // Check first: no point consuming anything if nothing is waiting.
+    mailfetch::CheckResult check;
+    if (mailfetch::Check(cfg, check) && !check.has_mail) {
+        LOG("nothing waiting -- not calling receive, so nothing is consumed");
+        LOG("=== fetch mail done ===");
+        return;
+    }
+
+    // Back the inbox up before it changes.
+    std::vector<uint8_t> backup;
+    if (!nand.ReadFile(wc24::kWc24RecvCtl, backup) ||
+        !SaveToSd("wuc24_bak_recv_ctl.bin", backup.data(), backup.size())) {
+        LOG("aborted: could not back up the inbox index");
+        return;
+    }
+    if (!nand.ReadFile(wc24::kWc24RecvMbx, backup) ||
+        !SaveToSd("wuc24_bak_recv_mbx.bin", backup.data(), backup.size())) {
+        LOG("aborted: could not back up the inbox mailbox");
+        return;
+    }
+    backup.clear();
+    backup.shrink_to_fit();
+
+    std::vector<std::string> messages;
+    if (!mailfetch::Receive(cfg, messages)) {
+        LOG("fetch failed");
+        return;
+    }
+    if (messages.empty()) {
+        LOG("the server returned no messages");
+        LOG("=== fetch mail done ===");
+        return;
+    }
+
+    // Keep a copy on SD regardless: they are gone from the server now, so if
+    // delivery fails this is the only remaining copy.
+    for (size_t i = 0; i < messages.size(); i++) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "wuc24_fetched_%02zu.msg", i);
+        SaveToSd(name, messages[i].data(), messages[i].size());
+    }
+
+    size_t delivered = 0;
+    for (const auto &message : messages) {
+        if (mail::DeliverRaw(nand, message, commit)) {
+            delivered++;
+        } else {
+            LOG("failed to deliver one message -- it is on SD as wuc24_fetched_*.msg");
+        }
+    }
+
+    LOG("=== fetch mail done: %zu of %zu delivered ===", delivered, messages.size());
+    if (commit && delivered > 0) LOG("boot vWii and check the message board");
+}
+
 // Minimal write test for the inbox index.
 //
 // Injecting a message and finding the file reverted afterwards has two very
@@ -1259,6 +1368,18 @@ static void OnCommitToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     }
 }
 
+static void OnMailCheckToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    if (newValue) {
+        RunGuarded("MailCheck", [] { RunMailCheck(); });
+    }
+}
+
+static void OnFetchMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    if (newValue) {
+        RunGuarded("FetchMail", [] { RunFetchMail(true); });
+    }
+}
+
 static void OnMailProbeToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     if (newValue) {
         RunGuarded("MailProbe", [] { RunMailProbe(); });
@@ -1333,6 +1454,9 @@ static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHa
         root, "wiilink_dns", "Resolve via WiiLink DNS (167.235.229.36) — currently unresponsive",
         false, s_useWiiLinkDns, &OnWiiLinkDnsToggled);
     WUPSConfigItemBoolean_AddToCategory(
+        root, "mail_check", "MAIL CHECK: is mail waiting on the server? (read-only)",
+        false, false, &OnMailCheckToggled);
+    WUPSConfigItemBoolean_AddToCategory(
         root, "mail_cfg", "MAIL CONFIG: show this console's mail identity (read-only)",
         false, false, &OnMailConfigToggled);
     WUPSConfigItemBoolean_AddToCategory(
@@ -1362,6 +1486,9 @@ static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHa
     WUPSConfigItemBoolean_AddToCategory(
         root, "clear", "CLEAR: delete WC24 data from the containers (for testing)",
         false, false, &OnClearToggled);
+    WUPSConfigItemBoolean_AddToCategory(
+        root, "fetch_mail", "FETCH MAIL: download waiting mail into the inbox (needs arming)",
+        false, false, &OnFetchMailToggled);
     WUPSConfigItemBoolean_AddToCategory(
         root, "mail_probe", "MAIL PROBE: bump one inbox counter (needs arming)",
         false, false, &OnMailProbeToggled);

@@ -239,6 +239,87 @@ bool ResolveViaSystem(const std::string &host, std::string &out_ip) {
     return true;
 }
 
+namespace {
+
+// Resolves `host` and opens a connection, or returns -1.
+//
+// Prefers the configured DNS (WiiLink's is meant to redirect the dead Nintendo
+// hostnames) but never lets a DNS problem be fatal: it falls back to the
+// console's own resolver, which handles the WiiLink-native domains fine.
+int ConnectTo(const std::string &host, uint16_t port) {
+    struct sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port   = htons(port);
+
+    const char *via = "custom dns";
+    if (!ResolveViaDns(host, &target.sin_addr)) {
+        via = "system resolver";
+
+        struct addrinfo hints{};
+        hints.ai_family      = AF_INET;
+        hints.ai_socktype    = SOCK_STREAM;
+        struct addrinfo *res = nullptr;
+        const int gai = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+        if (gai != 0 || !res) {
+            LOG("http: could not resolve %s (gai=%d)", host.c_str(), gai);
+            if (res) freeaddrinfo(res);
+            return -1;
+        }
+        target.sin_addr = reinterpret_cast<struct sockaddr_in *>(res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
+    }
+
+    char ip_str[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &target.sin_addr, ip_str, sizeof(ip_str));
+    LOG("http: %s -> %s:%u (%s)", host.c_str(), ip_str, port, via);
+
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOG("http: socket() failed (%d)", fd);
+        return -1;
+    }
+    if (connect(fd, reinterpret_cast<struct sockaddr *>(&target), sizeof(target)) != 0) {
+        LOG("http: connect() to %s:%u failed", ip_str, port);
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Reads until the peer closes (we always ask for "Connection: close", so there
+// is no need to understand Content-Length or chunked framing), then splits the
+// headers off.
+bool ReadResponse(int fd, std::vector<uint8_t> &out_body, int &out_status) {
+    std::vector<uint8_t> raw;
+    uint8_t              chunk[4096];
+    for (;;) {
+        const int n = recv(fd, chunk, sizeof(chunk), 0);
+        if (n < 0) {
+            LOG("http: recv() failed after %zu bytes", raw.size());
+            return false;
+        }
+        if (n == 0) break;  // peer closed -- end of response
+        raw.insert(raw.end(), chunk, chunk + n);
+    }
+
+    size_t header_end = 0;
+    if (!SplitHeaders(raw, header_end)) {
+        LOG("http: no header terminator found in %zu bytes", raw.size());
+        return false;
+    }
+
+    std::string status_line(reinterpret_cast<char *>(raw.data()),
+                            std::min<size_t>(raw.size(), 64));
+    const size_t eol = status_line.find("\r\n");
+    if (eol != std::string::npos) status_line.resize(eol);
+    out_status = ParseStatusCode(status_line);
+
+    out_body.assign(raw.begin() + header_end, raw.end());
+    return true;
+}
+
+}  // namespace
+
 bool HttpGet(const std::string &url, std::vector<uint8_t> &out_body, int &out_status) {
     out_body.clear();
     out_status = 0;
@@ -249,52 +330,14 @@ bool HttpGet(const std::string &url, std::vector<uint8_t> &out_body, int &out_st
     }
 
     std::string host, path;
-    uint16_t port;
+    uint16_t    port;
     if (!ParseHttpUrl(url, host, port, path)) {
         LOG("HttpGet: could not parse URL: %s", url.c_str());
         return false;
     }
 
-    struct sockaddr_in target {};
-    target.sin_family = AF_INET;
-    target.sin_port   = htons(port);
-
-    // Prefer the configured DNS (WiiLink's redirects the dead Nintendo
-    // hostnames), but never let a DNS problem be fatal: fall back to the
-    // console's own resolver, which handles the WiiLink-native domains fine.
-    const char *via = "custom dns";
-    if (!ResolveViaDns(host, &target.sin_addr)) {
-        via = "system resolver";
-
-        struct addrinfo hints{};
-        hints.ai_family   = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo *res = nullptr;
-        const int gai = getaddrinfo(host.c_str(), nullptr, &hints, &res);
-        if (gai != 0 || !res) {
-            LOG("HttpGet: could not resolve %s (gai=%d)", host.c_str(), gai);
-            if (res) freeaddrinfo(res);
-            return false;
-        }
-        target.sin_addr = reinterpret_cast<struct sockaddr_in *>(res->ai_addr)->sin_addr;
-        freeaddrinfo(res);
-    }
-
-    char ip_str[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &target.sin_addr, ip_str, sizeof(ip_str));
-    LOG("HttpGet: %s -> %s:%u (%s)", host.c_str(), ip_str, port, via);
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        LOG("HttpGet: socket() failed (%d)", fd);
-        return false;
-    }
-
-    if (connect(fd, reinterpret_cast<struct sockaddr *>(&target), sizeof(target)) != 0) {
-        LOG("HttpGet: connect() to %s:%u failed", ip_str, port);
-        close(fd);
-        return false;
-    }
+    const int fd = ConnectTo(host, port);
+    if (fd < 0) return false;
 
     char req[1024];
     std::snprintf(req, sizeof(req),
@@ -312,36 +355,58 @@ bool HttpGet(const std::string &url, std::vector<uint8_t> &out_body, int &out_st
         return false;
     }
 
-    std::vector<uint8_t> raw;
-    uint8_t chunk[4096];
-    for (;;) {
-        int n = recv(fd, chunk, sizeof(chunk), 0);
-        if (n < 0) {
-            LOG("HttpGet: recv() failed after %zu bytes", raw.size());
-            close(fd);
-            return false;
-        }
-        if (n == 0) break;  // peer closed -- end of response
-        raw.insert(raw.end(), chunk, chunk + n);
-    }
+    const bool ok = ReadResponse(fd, out_body, out_status);
     close(fd);
+    if (ok) {
+        LOG("HttpGet: %s -> status %d, %zu body bytes", url.c_str(), out_status,
+            out_body.size());
+    }
+    return ok;
+}
 
-    size_t header_end = 0;
-    if (!SplitHeaders(raw, header_end)) {
-        LOG("HttpGet: no header terminator found in %zu bytes", raw.size());
+bool HttpPostForm(const std::string &url, const std::string &form,
+                  std::vector<uint8_t> &out_body, int &out_status) {
+    out_body.clear();
+    out_status = 0;
+
+    if (url.compare(0, 8, "https://") == 0) {
+        LOG("HttpPostForm: HTTPS not supported yet");
         return false;
     }
 
-    std::string status_line(reinterpret_cast<char *>(raw.data()),
-                             std::min<size_t>(raw.size(), 64));
-    const size_t eol = status_line.find("\r\n");
-    if (eol != std::string::npos) status_line.resize(eol);
-    out_status = ParseStatusCode(status_line);
+    std::string host, path;
+    uint16_t    port;
+    if (!ParseHttpUrl(url, host, port, path)) {
+        LOG("HttpPostForm: could not parse URL: %s", url.c_str());
+        return false;
+    }
 
-    out_body.assign(raw.begin() + header_end, raw.end());
-    LOG("HttpGet: %s -> status %d, %zu header bytes, %zu body bytes",
-        url.c_str(), out_status, header_end, out_body.size());
-    return true;
+    const int fd = ConnectTo(host, port);
+    if (fd < 0) return false;
+
+    // The form body carries mail credentials, so only its length is logged.
+    char head[1024];
+    std::snprintf(head, sizeof(head),
+                  "POST %s HTTP/1.1\r\n"
+                  "Host: %s\r\n"
+                  "User-Agent: wuc24/0.1\r\n"
+                  "Content-Type: application/x-www-form-urlencoded\r\n"
+                  "Content-Length: %zu\r\n"
+                  "Connection: close\r\n"
+                  "\r\n",
+                  path.c_str(), host.c_str(), form.size());
+
+    if (!SendAll(fd, std::string(head) + form)) {
+        LOG("HttpPostForm: send() failed");
+        close(fd);
+        return false;
+    }
+    LOG("HttpPostForm: %s (%zu byte form)", url.c_str(), form.size());
+
+    const bool ok = ReadResponse(fd, out_body, out_status);
+    close(fd);
+    if (ok) LOG("HttpPostForm: status %d, %zu body bytes", out_status, out_body.size());
+    return ok;
 }
 
 }  // namespace net

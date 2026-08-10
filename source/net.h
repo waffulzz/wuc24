@@ -35,6 +35,12 @@ void SetDnsServer(const char *ipv4);
 // body and `out_status` the HTTP status code (e.g. 200).
 bool HttpGet(const std::string &url, std::vector<uint8_t> &out_body, int &out_status);
 
+// HTTP/1.1 POST of an application/x-www-form-urlencoded body, which is how the
+// WC24 mail CGI endpoints are addressed. The form is never logged: it carries
+// the console's mail credentials.
+bool HttpPostForm(const std::string &url, const std::string &form,
+                  std::vector<uint8_t> &out_body, int &out_status);
+
 // A well-known public resolver, used as a control in the DNS diagnostics: if
 // a lookup works through this but not through WiiLink's server, the DNS client
 // itself is fine and the problem is the server or the network path to it.

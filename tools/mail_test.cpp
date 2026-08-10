@@ -123,7 +123,26 @@ int main() {
         Check(s3.body_offset < (1u << 20), "offsets fit the 20-bit field");
     }
 
-    std::printf("\n5. date rendering (minutes since 1900)\n");
+    std::printf("\n5. AnalyseMessage agrees with BuildMessage\n");
+    {
+        // Anything we build must parse back to the same spans, since fetched
+        // mail is indexed by parsing rather than by construction.
+        mail::FieldSpans parsed;
+        Check(mail::AnalyseMessage(text, parsed), "parsed a message we built");
+        Check(parsed.from_offset == spans.from_offset &&
+                  parsed.from_length == spans.from_length, "From span round-trips");
+        Check(parsed.to_offset == spans.to_offset &&
+                  parsed.to_length == spans.to_length, "To span round-trips");
+        Check(parsed.subject_offset == spans.subject_offset &&
+                  parsed.subject_length == spans.subject_length, "Subject span round-trips");
+        Check(parsed.charset_offset == spans.charset_offset &&
+                  parsed.charset_length == spans.charset_length, "charset span round-trips");
+        Check(parsed.mime_offset == spans.mime_offset, "header_len round-trips");
+        Check(parsed.body_offset == spans.body_offset, "body offset round-trips");
+        Check(parsed.body_length == spans.body_length, "body length round-trips");
+    }
+
+    std::printf("\n6. date rendering (minutes since 1900)\n");
     {
         struct Case { uint32_t minutes; const char *expect; };
         // Cross-checked against Python: (datetime - 1900-01-01) in minutes.

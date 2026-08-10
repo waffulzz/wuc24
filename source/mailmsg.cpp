@@ -96,6 +96,104 @@ std::string ToUtf16Be(const std::string &in) {
 
 }  // namespace
 
+namespace {
+
+// Span of a header's value, from just after "Name: " to the end of the line.
+bool FindHeaderValue(const std::string &text, size_t search_from, size_t search_to,
+                     const char *name, uint32_t *offset, uint32_t *length) {
+    const std::string needle = std::string(name) + ": ";
+    size_t at = text.find(needle, search_from);
+    if (at == std::string::npos || at >= search_to) return false;
+
+    // Must start a line, or "To: " would match inside "Reply-To: ".
+    if (at != 0 && text.compare(at - 2, 2, "\r\n") != 0) {
+        at = text.find("\r\n" + needle, search_from);
+        if (at == std::string::npos || at >= search_to) return false;
+        at += 2;
+    }
+
+    const size_t value = at + needle.size();
+    size_t       eol   = text.find("\r\n", value);
+    if (eol == std::string::npos) eol = text.size();
+
+    *offset = static_cast<uint32_t>(value);
+    *length = static_cast<uint32_t>(eol - value);
+    return true;
+}
+
+}  // namespace
+
+bool AnalyseMessage(const std::string &text, FieldSpans &spans) {
+    spans = FieldSpans{};
+
+    // The outer headers end at the first blank line; the MIME body starts
+    // there, which is what the entry's header_length points at.
+    const size_t header_end = text.find("\r\n\r\n");
+    if (header_end == std::string::npos) return false;
+    const size_t mime_start = header_end + 4;
+    spans.mime_offset       = static_cast<uint32_t>(mime_start);
+
+    FindHeaderValue(text, 0, mime_start, "From", &spans.from_offset, &spans.from_length);
+    FindHeaderValue(text, 0, mime_start, "To", &spans.to_offset, &spans.to_length);
+    FindHeaderValue(text, 0, mime_start, "Subject", &spans.subject_offset, &spans.subject_length);
+
+    // Pull the boundary out of the outer Content-Type.
+    std::string boundary;
+    const size_t b = text.find("boundary=", 0);
+    if (b != std::string::npos && b < mime_start) {
+        size_t start = b + 9;
+        char   term  = '\r';
+        if (start < text.size() && text[start] == '"') {
+            term = '"';
+            start++;
+        }
+        size_t end = text.find(term, start);
+        if (end == std::string::npos) end = text.size();
+        boundary = text.substr(start, end - start);
+    }
+    if (boundary.empty()) {
+        // Not multipart: the body is simply everything after the headers.
+        spans.body_offset = static_cast<uint32_t>(mime_start);
+        spans.body_length = static_cast<uint32_t>(text.size() - mime_start);
+        return true;
+    }
+
+    // Prefer the part marked as the message-board body; fall back to the first.
+    const std::string delim = "--" + boundary;
+    size_t part = text.find("Content-Description: wiimail", mime_start);
+    if (part != std::string::npos) {
+        part = text.rfind(delim, part);
+    } else {
+        part = text.find(delim, mime_start);
+    }
+    if (part == std::string::npos) return false;
+
+    const size_t part_headers_end = text.find("\r\n\r\n", part);
+    if (part_headers_end == std::string::npos) return false;
+
+    // charset within this part's Content-Type, value only.
+    const size_t cs = text.find("charset=", part);
+    if (cs != std::string::npos && cs < part_headers_end) {
+        const size_t start = cs + 8;
+        size_t       end   = start;
+        while (end < text.size() && text[end] != '\r' && text[end] != ';' && text[end] != ' ') {
+            end++;
+        }
+        spans.charset_offset = static_cast<uint32_t>(start);
+        spans.charset_length = static_cast<uint32_t>(end - start);
+    }
+
+    spans.body_offset = static_cast<uint32_t>(part_headers_end + 4);
+
+    // The body runs right up to where the next boundary begins -- the blank
+    // lines and the final CRLF before it are counted in. A real entry measures
+    // a 38-character line as 46 bytes for exactly this reason.
+    size_t next = text.find(delim, spans.body_offset);
+    if (next == std::string::npos) next = text.size();
+    spans.body_length = static_cast<uint32_t>(next - spans.body_offset);
+    return true;
+}
+
 std::string BuildMessage(const Message &msg, uint32_t id, uint64_t friend_code,
                          uint32_t minutes_since_1900, FieldSpans &spans) {
     (void)id;

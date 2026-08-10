@@ -12,6 +12,22 @@
 namespace mail {
 
 bool Deliver(VwiiNand &nand, const Message &msg, bool commit) {
+    // The Message-Id is cosmetic, so a placeholder id is fine here; DeliverRaw
+    // assigns the real one from the inbox header.
+    FieldSpans        spans;
+    const std::string text = BuildMessage(msg, 0, 0, 0, spans);
+    return DeliverRaw(nand, text, commit);
+}
+
+bool DeliverRaw(VwiiNand &nand, const std::string &text, bool commit) {
+    // Messages fetched from the server arrive already in the stored form, so
+    // they are written verbatim and the entry is derived by parsing them.
+    FieldSpans spans;
+    if (!AnalyseMessage(text, spans)) {
+        LOG("mail: could not make sense of the message");
+        return false;
+    }
+
     // --- read the index -----------------------------------------------------
     std::vector<uint8_t> ctl;
     if (!nand.ReadFile(wc24::kWc24RecvCtl, ctl)) {
@@ -31,8 +47,7 @@ bool Deliver(VwiiNand &nand, const Message &msg, bool commit) {
         return false;
     }
 
-    // Where the console says the next entry goes. Offsets are from the start
-    // of the file, with the 128-byte header first.
+    // Where the console says the next entry goes.
     uint32_t slot = 0;
     if (header.next_entry_offset >= sizeof(wc24::MailListHeader)) {
         slot = (header.next_entry_offset - sizeof(wc24::MailListHeader)) /
@@ -51,17 +66,7 @@ bool Deliver(VwiiNand &nand, const Message &msg, bool commit) {
     }
 
     const uint32_t id = header.next_entry_id;
-
-    // The entry timestamps mail in minutes since 1900, which is also what the
-    // Date: header is rendered from. 2208988800 is the gap from 1900 to the
-    // Unix epoch.
-    const uint32_t minutes_since_1900 =
-        static_cast<uint32_t>((static_cast<uint64_t>(std::time(nullptr)) + 2208988800ULL) / 60);
-
-    // --- build the message --------------------------------------------------
-    FieldSpans        spans;
-    const std::string text = BuildMessage(msg, id, 0, minutes_since_1900, spans);
-    LOG("mail: built a %zu byte message, body at %u (%u bytes)", text.size(), spans.body_offset,
+    LOG("mail: %zu byte message, body at %u (%u bytes)", text.size(), spans.body_offset,
         spans.body_length);
 
     // --- store it in the mailbox VFF ---------------------------------------
