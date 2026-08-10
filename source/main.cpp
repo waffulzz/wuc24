@@ -94,6 +94,25 @@ static bool SaveToSd(const char *name, const void *data, size_t size) {
 }
 
 // ---------------------------------------------------------------------------
+// Progress reporting
+//
+// The channel update is minutes of work -- the News Channel alone is 24 files
+// and several megabytes. A notification that says "updating channels" for all
+// of it is indistinguishable from a hang, so the long-running actions report
+// each step into here and the toast follows along.
+// ---------------------------------------------------------------------------
+
+static toast::Progress *s_progress = nullptr;
+
+static void Report(const std::string &text) {
+    if (s_progress) {
+        s_progress->Update(text);
+    } else {
+        LOG("%s", text.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
 
@@ -215,8 +234,22 @@ static void ExpandTask(const DlTaskInfo &t, std::vector<DownloadUnit> &out) {
 struct ContainerJob {
     std::string               vff_path;
     std::string               backup_name;
+    std::string               label;  // what to call it on screen
     std::vector<DownloadUnit> units;
 };
+
+// The four-character title code is the only name we have for a channel, and it
+// means nothing to anyone reading a notification.
+static std::string ChannelLabel(const DlTaskInfo &t) {
+    if (t.high_title_id == "HAFE" || t.high_title_id == "HAFA") return "Forecast";
+    if (t.high_title_id == "HAGE" || t.high_title_id == "HAGA") return "News";
+    if (t.high_title_id == "HAJE" || t.high_title_id == "HAJA") return "Everybody Votes";
+    if (t.high_title_id == "HATE" || t.high_title_id == "HATA") return "Nintendo Channel";
+    if (t.high_title_id == "HABA") return "Wii Shop";
+    if (t.high_title_id == "RZTE") return "Wii Sports Resort";
+    if (t.high_title_id == "RMCE") return "Mario Kart Wii";
+    return t.high_title_id;
+}
 
 // Collects the containers to update and the files destined for each.
 static void BuildJobs(const std::vector<DlTaskInfo> &tasks, std::vector<ContainerJob> &jobs,
@@ -233,10 +266,30 @@ static void BuildJobs(const std::vector<DlTaskInfo> &tasks, std::vector<Containe
             if (j.vff_path == t.vff_path) job = &j;
         }
         if (!job) {
-            jobs.push_back(ContainerJob{t.vff_path, BackupNameFor(t), {}});
+            jobs.push_back(ContainerJob{t.vff_path, BackupNameFor(t), ChannelLabel(t), {}});
             job = &jobs.back();
         }
-        ExpandTask(t, job->units);
+        // Some titles list the same file twice from different URLs -- the
+        // Nintendo Channel asks for csdata.bn and csdata.LZ, which serve byte
+        // for byte the same thing. Both would land on the same filename, so
+        // the second is only a wasted download and a coin toss over which one
+        // wins. Keep the first.
+        std::vector<DownloadUnit> expanded;
+        ExpandTask(t, expanded);
+        for (auto &unit : expanded) {
+            bool duplicate = false;
+            for (const auto &existing : job->units) {
+                if (existing.filename == unit.filename) duplicate = true;
+            }
+            if (duplicate) {
+                if (log_skips) {
+                    LOG("skipping [%u] %s: already provided by another task", t.index,
+                        unit.filename.c_str());
+                }
+                continue;
+            }
+            job->units.push_back(std::move(unit));
+        }
     }
 }
 
@@ -336,8 +389,16 @@ static void RunPipeline(bool commit) {
 
     size_t containers_ok = 0, containers_failed = 0;
 
+    size_t job_index = 0;
     for (const auto &job : jobs) {
+        job_index++;
         LOG("--- %s (%zu file(s)) ---", job.vff_path.c_str(), job.units.size());
+        {
+            char step[128];
+            std::snprintf(step, sizeof(step), "WiiConnect24: %s (%zu/%zu)",
+                          job.label.c_str(), job_index, jobs.size());
+            Report(step);
+        }
 
         // 1. read the container and log what the channel currently has. Done
         //    before anything can fail, so a container we end up skipping still
@@ -442,6 +503,13 @@ static void RunPipeline(bool commit) {
                 }
                 LOG("  (%zu/%zu) %s: %zu bytes stored", n, job.units.size(),
                     unit.filename.c_str(), payload.size());
+                if (job.units.size() > 1) {
+                    char step[128];
+                    std::snprintf(step, sizeof(step), "WiiConnect24: %s (%zu/%zu) %zu%%",
+                                  job.label.c_str(), job_index, jobs.size(),
+                                  (n * 100) / job.units.size());
+                    Report(step);
+                }
             }
         }
         if (!all_ok) {
@@ -998,6 +1066,13 @@ static bool IsWiiUMenu() {
 static void AutorunJob() {
     LOG("=== automatic run ===");
     toast::Progress progress("WiiConnect24: starting");
+    s_progress = &progress;
+
+    // Anything that leaves early has to clear this, or Report() would write
+    // into a destroyed notification.
+    struct ProgressScope {
+        ~ProgressScope() { s_progress = nullptr; }
+    } progress_scope;
 
     {
         VwiiNand nand;
@@ -1022,8 +1097,10 @@ static void AutorunJob() {
     }
 
     if (guard::StopRequested()) {
-        progress.Finish("WiiConnect24: stopped");
-        LOG("=== automatic run stopped early ===");
+        // Nothing was written, so there is nothing for the user to act on.
+        // Say so plainly rather than raising an alarm.
+        progress.Finish("WiiConnect24: postponed");
+        LOG("=== automatic run stopped early, nothing was modified ===");
         return;
     }
 
@@ -1031,7 +1108,7 @@ static void AutorunJob() {
     RunPipeline(true);
 
     if (guard::StopRequested()) {
-        progress.Finish("WiiConnect24: stopped, nothing left half-written");
+        progress.Finish("WiiConnect24: postponed, nothing left half-written");
     } else {
         progress.Finish("WiiConnect24: up to date");
     }
@@ -1180,6 +1257,9 @@ ON_APPLICATION_START() {
     LogInit();
     net::Init();
     toast::Init();
+
+    const uint64_t title = OSGetTitleID();
+    LOG("application started: title %016llx", static_cast<unsigned long long>(title));
 
     if (!s_autorun) return;
     if (!IsWiiUMenu()) {
