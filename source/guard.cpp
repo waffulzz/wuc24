@@ -16,6 +16,7 @@ namespace guard {
 namespace {
 
 volatile uint32_t s_stop     = 0;
+const char       *s_reason   = "";
 volatile int32_t  s_critical = 0;
 
 // Kept deliberately simple: one line of "nand path -> backup file", so that
@@ -30,12 +31,20 @@ std::string JournalPath() {
 
 }  // namespace
 
-void RequestStop() {
-    OSCompareAndSwapAtomic(&s_stop, 0, 1);
+void RequestStop(const char *reason) {
+    if (OSCompareAndSwapAtomic(&s_stop, 0, 1)) {
+        s_reason = reason ? reason : "?";
+        LOG("guard: stop requested by %s", s_reason);
+    }
+}
+
+const char *StopReason() {
+    return s_reason;
 }
 
 void ClearStop() {
-    s_stop = 0;
+    s_stop   = 0;
+    s_reason = "";
 }
 
 bool StopRequested() {

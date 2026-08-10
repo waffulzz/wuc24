@@ -19,7 +19,7 @@ bool Start(Job job);
 // Asks the job to stop and waits up to `timeout_ms` for it. Returns true if the
 // thread finished; false means it is still going and the process is about to
 // take it down anyway -- which is what the recovery journal is for.
-bool Stop(int timeout_ms);
+bool Stop(const char *reason, int timeout_ms);
 
 bool Running();
 

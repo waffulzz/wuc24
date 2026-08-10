@@ -27,8 +27,11 @@ class VwiiNand;
 
 namespace guard {
 
-// Raised when the running title is going away.
-void RequestStop();
+// Raised when the running title is going away. `reason` is recorded so a log
+// can say what asked, which matters when something requests a stop during boot
+// and the job appears to give up for no reason.
+void RequestStop(const char *reason);
+const char *StopReason();
 void ClearStop();
 bool StopRequested();
 

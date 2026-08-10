@@ -80,10 +80,10 @@ bool Start(Job job) {
     return true;
 }
 
-bool Stop(int timeout_ms) {
+bool Stop(const char *reason, int timeout_ms) {
     if (!s_thread) return true;
 
-    guard::RequestStop();
+    guard::RequestStop(reason);
 
     // A write already under way is short; letting it finish is far better than
     // being killed inside it.

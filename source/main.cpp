@@ -15,6 +15,7 @@
 // channel's data half-written. See guard.h for how that is arranged.
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <vector>
 
@@ -1046,6 +1047,19 @@ static bool s_autorun = false;
 // Whether to hand queued mail to the server, and to pull down waiting mail.
 static bool s_autoMail = true;
 
+// When the job last finished, as a Unix timestamp, kept in plugin storage.
+//
+// A plugin is reloaded for every title, so nothing in memory survives to tell a
+// cold boot apart from coming back to the Menu after a game -- and the Menu
+// starting is the only signal available. Without this, quitting a game would
+// kick off several megabytes of downloads every single time. Persisting the
+// last run is the only thing that actually distinguishes the two.
+static int64_t s_lastRun = 0;
+
+// How long to leave it before running again. WiiConnect24 content is refreshed
+// on the order of hours, so anything shorter is just noise.
+static constexpr int64_t kCooldownSeconds = 3 * 60 * 60;
+
 // The Wii U Menu, by region. The job only runs here: kicking off several
 // megabytes of downloads because someone launched a game would be rude, and the
 // Menu is where the console sits idle anyway.
@@ -1100,7 +1114,8 @@ static void AutorunJob() {
         // Nothing was written, so there is nothing for the user to act on.
         // Say so plainly rather than raising an alarm.
         progress.Finish("WiiConnect24: postponed");
-        LOG("=== automatic run stopped early, nothing was modified ===");
+        LOG("=== automatic run stopped early (%s), nothing was modified ===",
+            guard::StopReason());
         return;
     }
 
@@ -1109,8 +1124,14 @@ static void AutorunJob() {
 
     if (guard::StopRequested()) {
         progress.Finish("WiiConnect24: postponed, nothing left half-written");
+        LOG("stopped because: %s", guard::StopReason());
     } else {
         progress.Finish("WiiConnect24: up to date");
+        // Only a run that got all the way through counts, so an interrupted
+        // one is retried rather than being locked out by the cooldown.
+        s_lastRun = static_cast<int64_t>(std::time(nullptr));
+        WUPSStorageAPI::Store("last_run", s_lastRun);
+        WUPSStorageAPI::SaveStorage();
     }
     LOG("=== automatic run done ===");
 }
@@ -1151,6 +1172,7 @@ static void OnAutoMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
 // closing the menu never leaves the console waiting on a download.
 static void OnRunNowToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     if (!newValue) return;
+    // Asked for directly, so the cooldown does not apply.
     if (autorun::Running()) {
         toast::Info("WiiConnect24: already running");
         return;
@@ -1233,6 +1255,7 @@ INITIALIZE_PLUGIN() {
 
     WUPSStorageAPI::GetOrStoreDefault("autorun", s_autorun, false);
     WUPSStorageAPI::GetOrStoreDefault("automail", s_autoMail, true);
+    WUPSStorageAPI::GetOrStoreDefault("last_run", s_lastRun, static_cast<int64_t>(0));
 
     // The console's own resolver handles every host we actually use; stale
     // Nintendo hostnames are dealt with by kHostOverrides instead.
@@ -1247,7 +1270,7 @@ INITIALIZE_PLUGIN() {
 }
 
 DEINITIALIZE_PLUGIN() {
-    autorun::Stop(5000);
+    autorun::Stop("plugin deinit", 5000);
     toast::Shutdown();
     LOG("wuc24 deinitialised");
     LogDeinit();
@@ -1266,6 +1289,15 @@ ON_APPLICATION_START() {
         LOG("autorun: not the Wii U Menu, staying out of the way");
         return;
     }
+
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t age = now - s_lastRun;
+    if (s_lastRun > 0 && age >= 0 && age < kCooldownSeconds) {
+        LOG("autorun: last run was %lld minutes ago, waiting until %lld have passed",
+            static_cast<long long>(age / 60), static_cast<long long>(kCooldownSeconds / 60));
+        return;
+    }
+
     LOG("autorun: starting the background job");
     autorun::Start(&AutorunJob);
 }
@@ -1274,10 +1306,10 @@ ON_APPLICATION_START() {
 // shutting down. Ask the job to stop and give a write in flight time to land.
 ON_APPLICATION_REQUESTS_EXIT() {
     if (autorun::Running()) LOG("autorun: exit requested, winding up");
-    autorun::Stop(5000);
+    autorun::Stop("application requested exit", 5000);
 }
 
 ON_APPLICATION_ENDS() {
-    autorun::Stop(5000);
+    autorun::Stop("application ended", 5000);
     toast::Shutdown();
 }
