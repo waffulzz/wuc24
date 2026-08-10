@@ -805,6 +805,93 @@ static void RunFetchMail(bool commit) {
     if (commit && delivered > 0) LOG("boot vWii and check the message board");
 }
 
+// Sends whatever is sitting in the outbox.
+//
+// The console queues mail written on the message board and sends it the next
+// time WiiConnect24 runs; this does that job from Wii U mode instead. Messages
+// are only retired from the outbox once the server says it took them, so a
+// failure leaves them queued for the console to send later.
+static void RunSendMail(bool commit) {
+    LOG("=== send mail (%s) ===", commit ? "COMMIT" : "dry run");
+
+    if (commit && !s_armed) {
+        LOG("refusing to write: enable \"Arm NAND write\" first");
+        return;
+    }
+
+    VwiiNand nand;
+    if (!nand.ok()) {
+        LOG("aborted: vWii NAND not available");
+        return;
+    }
+    msgcfg::Config cfg;
+    if (!msgcfg::Read(nand, cfg)) {
+        LOG("aborted: cannot read the mail config");
+        return;
+    }
+
+    std::vector<mail::Queued> queued;
+    if (!mail::ReadOutbox(nand, queued)) {
+        LOG("aborted: cannot read the outbox");
+        return;
+    }
+    if (queued.empty()) {
+        LOG("nothing queued to send");
+        LOG("=== send mail done ===");
+        return;
+    }
+
+    // Keep a copy: once the server accepts them they leave the console.
+    for (size_t i = 0; i < queued.size(); i++) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "wuc24_outbox_%02zu.msg", i);
+        SaveToSd(name, queued[i].text.data(), queued[i].text.size());
+    }
+
+    std::vector<uint8_t> backup;
+    if (!nand.ReadFile(wc24::kWc24SendCtl, backup) ||
+        !SaveToSd("wuc24_bak_send_ctl.bin", backup.data(), backup.size())) {
+        LOG("aborted: could not back up the send index");
+        return;
+    }
+    if (!nand.ReadFile(wc24::kWc24SendMbx, backup) ||
+        !SaveToSd("wuc24_bak_send_mbx.bin", backup.data(), backup.size())) {
+        LOG("aborted: could not back up the send mailbox");
+        return;
+    }
+    backup.clear();
+    backup.shrink_to_fit();
+
+    std::vector<std::string> texts;
+    texts.reserve(queued.size());
+    for (const auto &q : queued) texts.push_back(q.text);
+
+    net::Init();
+    std::vector<bool> accepted;
+    if (!mailfetch::Send(cfg, texts, accepted)) {
+        LOG("send failed -- everything stays queued");
+        return;
+    }
+
+    std::vector<mail::Queued> sent;
+    for (size_t i = 0; i < queued.size(); i++) {
+        if (i < accepted.size() && accepted[i]) sent.push_back(queued[i]);
+    }
+    LOG("%zu of %zu accepted by the server", sent.size(), queued.size());
+
+    if (sent.empty()) {
+        LOG("=== send mail done ===");
+        return;
+    }
+    if (!mail::ClearFromOutbox(nand, sent, commit)) {
+        LOG("WARNING: the server took the mail but the outbox could not be updated.");
+        LOG("The console may send them again. Backups are on SD.");
+        return;
+    }
+
+    LOG("=== send mail done ===");
+}
+
 // Minimal write test for the inbox index.
 //
 // Injecting a message and finding the file reverted afterwards has two very
@@ -1380,6 +1467,18 @@ static void OnFetchMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     }
 }
 
+static void OnSendMailDryToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    if (newValue) {
+        RunGuarded("SendMailDry", [] { RunSendMail(false); });
+    }
+}
+
+static void OnSendMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    if (newValue) {
+        RunGuarded("SendMail", [] { RunSendMail(true); });
+    }
+}
+
 static void OnMailProbeToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     if (newValue) {
         RunGuarded("MailProbe", [] { RunMailProbe(); });
@@ -1486,6 +1585,12 @@ static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHa
     WUPSConfigItemBoolean_AddToCategory(
         root, "clear", "CLEAR: delete WC24 data from the containers (for testing)",
         false, false, &OnClearToggled);
+    WUPSConfigItemBoolean_AddToCategory(
+        root, "send_dry", "SEND MAIL (dry run): show what is queued, send nothing",
+        false, false, &OnSendMailDryToggled);
+    WUPSConfigItemBoolean_AddToCategory(
+        root, "send_mail", "SEND MAIL: send queued outbox mail (needs arming)",
+        false, false, &OnSendMailToggled);
     WUPSConfigItemBoolean_AddToCategory(
         root, "fetch_mail", "FETCH MAIL: download waiting mail into the inbox (needs arming)",
         false, false, &OnFetchMailToggled);

@@ -54,6 +54,22 @@ bool AnalyseMessage(const std::string &text, FieldSpans &spans);
 // Stores an already-formed message in the inbox and indexes it.
 bool DeliverRaw(VwiiNand &nand, const std::string &text, bool commit);
 
+// A message sitting in the outbox waiting to go out.
+struct Queued {
+    uint32_t    slot = 0;   // index into the send list
+    uint32_t    id   = 0;
+    std::string text;       // the message as stored, trimmed to msg_size
+};
+
+// Reads everything queued in wc24send. Outbound messages keep their SMTP
+// envelope (MAIL FROM:/RCPT TO:/DATA) ahead of the headers, which is what the
+// server parses, so they are handed over untouched.
+bool ReadOutbox(VwiiNand &nand, std::vector<Queued> &out);
+
+// Removes messages from the outbox once the server has taken them, freeing the
+// slot and its id for reuse the way the console does.
+bool ClearFromOutbox(VwiiNand &nand, const std::vector<Queued> &sent, bool commit);
+
 // Reads the inbox, appends `msg`, and writes it back. Backs both files up to
 // SD first via the caller-supplied callback, and leaves NAND untouched unless
 // every step succeeds.

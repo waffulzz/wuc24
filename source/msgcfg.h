@@ -18,13 +18,15 @@ namespace msgcfg {
 inline constexpr uint32_t kMagic   = 0x57634366;  // 'WcCf'
 inline constexpr uint32_t kVersion = 8;
 
-// http_urls[] slots, per Dolphin's accessors.
+// http_urls[] slots, read off a real console rather than inferred -- the
+// endpoint names come back in this order, which is NOT the order Dolphin's
+// accessors imply (it has send at 0 and account at 4).
 enum UrlIndex {
-    URL_SEND    = 0,
+    URL_ACCOUNT = 0,
     URL_CHECK   = 1,
-    URL_RECEIVE = 2,  // not named by Dolphin; confirmed by inspection
+    URL_RECEIVE = 2,
     URL_DELETE  = 3,
-    URL_ACCOUNT = 4,
+    URL_SEND    = 4,
     URL_COUNT   = 5,
 };
 

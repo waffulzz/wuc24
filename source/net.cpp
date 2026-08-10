@@ -409,4 +409,63 @@ bool HttpPostForm(const std::string &url, const std::string &form,
     return ok;
 }
 
+bool HttpPostMultipart(const std::string &url,
+                       const std::vector<std::pair<std::string, std::string>> &parts,
+                       std::vector<uint8_t> &out_body, int &out_status) {
+    out_body.clear();
+    out_status = 0;
+
+    if (url.compare(0, 8, "https://") == 0) {
+        LOG("HttpPostMultipart: HTTPS not supported yet");
+        return false;
+    }
+
+    std::string host, path;
+    uint16_t    port;
+    if (!ParseHttpUrl(url, host, port, path)) {
+        LOG("HttpPostMultipart: could not parse URL: %s", url.c_str());
+        return false;
+    }
+
+    // Only needs to be absent from the values. The parts are messages and
+    // credentials, so something this unlikely is sufficient.
+    const std::string boundary = "----wuc24MultipartBoundary8fJ2kQ";
+
+    std::string body;
+    for (const auto &part : parts) {
+        body += "--" + boundary + "\r\n";
+        body += "Content-Disposition: form-data; name=\"" + part.first + "\"\r\n\r\n";
+        body += part.second;
+        body += "\r\n";
+    }
+    body += "--" + boundary + "--\r\n";
+
+    const int fd = ConnectTo(host, port);
+    if (fd < 0) return false;
+
+    char head[1024];
+    std::snprintf(head, sizeof(head),
+                  "POST %s HTTP/1.1\r\n"
+                  "Host: %s\r\n"
+                  "User-Agent: wuc24/0.1\r\n"
+                  "Content-Type: multipart/form-data; boundary=%s\r\n"
+                  "Content-Length: %zu\r\n"
+                  "Connection: close\r\n"
+                  "\r\n",
+                  path.c_str(), host.c_str(), boundary.c_str(), body.size());
+
+    if (!SendAll(fd, std::string(head) + body)) {
+        LOG("HttpPostMultipart: send() failed");
+        close(fd);
+        return false;
+    }
+    LOG("HttpPostMultipart: %s (%zu parts, %zu byte body)", url.c_str(), parts.size(),
+        body.size());
+
+    const bool ok = ReadResponse(fd, out_body, out_status);
+    close(fd);
+    if (ok) LOG("HttpPostMultipart: status %d, %zu body bytes", out_status, out_body.size());
+    return ok;
+}
+
 }  // namespace net

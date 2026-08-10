@@ -41,6 +41,14 @@ bool HttpGet(const std::string &url, std::vector<uint8_t> &out_body, int &out_st
 bool HttpPostForm(const std::string &url, const std::string &form,
                   std::vector<uint8_t> &out_body, int &out_status);
 
+// HTTP/1.1 POST of a multipart/form-data body, which is what send.cgi expects
+// (unlike the other endpoints, which take a urlencoded form). Values are sent
+// verbatim, so they may contain anything. Never logged: one of the fields
+// carries the console's mail password.
+bool HttpPostMultipart(const std::string &url,
+                       const std::vector<std::pair<std::string, std::string>> &parts,
+                       std::vector<uint8_t> &out_body, int &out_status);
+
 // A well-known public resolver, used as a control in the DNS diagnostics: if
 // a lookup works through this but not through WiiLink's server, the DNS client
 // itself is fine and the problem is the server or the network path to it.

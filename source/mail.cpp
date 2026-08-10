@@ -213,4 +213,133 @@ bool DeliverRaw(VwiiNand &nand, const std::string &text, bool commit) {
     return true;
 }
 
+
+
+bool ReadOutbox(VwiiNand &nand, std::vector<Queued> &out) {
+    out.clear();
+
+    std::vector<uint8_t> ctl;
+    if (!nand.ReadFile(wc24::kWc24SendCtl, ctl)) {
+        LOG("outbox: cannot read the send index");
+        return false;
+    }
+    const uint32_t capacity = wc24::MailEntryCount(ctl.size());
+    if (capacity == 0) {
+        LOG("outbox: send index is too small (%zu bytes)", ctl.size());
+        return false;
+    }
+
+    wc24::MailListHeader header;
+    std::memcpy(&header, ctl.data(), sizeof(header));
+    if (header.magic != wc24::kMailListMagic) {
+        LOG("outbox: bad send magic 0x%08X", header.magic);
+        return false;
+    }
+    LOG("outbox: %u message(s) queued", header.number_of_mail);
+    if (header.number_of_mail == 0) return true;
+
+    std::vector<uint8_t> mbx;
+    if (!nand.ReadFile(wc24::kWc24SendMbx, mbx)) {
+        LOG("outbox: cannot read the send mailbox");
+        return false;
+    }
+
+    const auto *entries =
+        reinterpret_cast<const wc24::MailListEntry *>(ctl.data() + sizeof(header));
+
+    vff::Image image(mbx);
+    if (!image.ok()) {
+        LOG("outbox: cannot mount the send mailbox");
+        return false;
+    }
+
+    for (uint32_t i = 0; i < capacity; i++) {
+        const wc24::MailListEntry &entry = entries[i];
+        if (entry.id == 0) continue;
+
+        // Outgoing messages use an 's' prefix where received ones use 'r'.
+        char path[64];
+        std::snprintf(path, sizeof(path), "mb/s%07u.msg", entry.id);
+
+        std::vector<uint8_t> raw;
+        if (!image.ReadFile(path, raw)) {
+            LOG("outbox: slot %u claims %s but it is not there", i, path);
+            continue;
+        }
+
+        // The file is NUL-padded to 32 bytes; msg_size is the real length.
+        if (entry.msg_size > 0 && entry.msg_size <= raw.size()) raw.resize(entry.msg_size);
+
+        Queued queued;
+        queued.slot = i;
+        queued.id   = entry.id;
+        queued.text.assign(raw.begin(), raw.end());
+        LOG("outbox: slot %u id %u, %zu bytes", i, entry.id, queued.text.size());
+        out.push_back(std::move(queued));
+    }
+    return true;
+}
+
+bool ClearFromOutbox(VwiiNand &nand, const std::vector<Queued> &sent, bool commit) {
+    if (sent.empty()) return true;
+
+    std::vector<uint8_t> ctl;
+    std::vector<uint8_t> mbx;
+    if (!nand.ReadFile(wc24::kWc24SendCtl, ctl) || !nand.ReadFile(wc24::kWc24SendMbx, mbx)) {
+        LOG("outbox: cannot re-read the send box to clear it");
+        return false;
+    }
+    const size_t mbx_size = mbx.size();
+
+    wc24::MailListHeader header;
+    std::memcpy(&header, ctl.data(), sizeof(header));
+    auto *entries = reinterpret_cast<wc24::MailListEntry *>(ctl.data() + sizeof(header));
+
+    {
+        vff::Image image(mbx);
+        if (!image.ok()) {
+            LOG("outbox: cannot mount the send mailbox to clear it");
+            return false;
+        }
+        for (const Queued &q : sent) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "mb/s%07u.msg", q.id);
+            image.DeleteFile(path);
+
+            // Mirrors how the console retires an entry: the slot and its id
+            // both become the next ones to be reused.
+            if (header.number_of_mail > 0) header.number_of_mail--;
+            if (header.total_size_of_messages >= entries[q.slot].msg_size) {
+                header.total_size_of_messages -= entries[q.slot].msg_size;
+            }
+            header.next_entry_id     = q.id;
+            header.next_entry_offset = static_cast<uint32_t>(
+                sizeof(wc24::MailListHeader) + q.slot * sizeof(wc24::MailListEntry));
+            std::memset(&entries[q.slot], 0, sizeof(wc24::MailListEntry));
+        }
+    }
+    std::memcpy(ctl.data(), &header, sizeof(header));
+
+    if (mbx.size() != mbx_size) {
+        LOG("outbox: mailbox changed size, not writing");
+        return false;
+    }
+    LOG("outbox: %zu message(s) retired, %u still queued", sent.size(), header.number_of_mail);
+
+    if (!commit) {
+        LOG("outbox: dry run -- NAND not modified");
+        return true;
+    }
+
+    if (!nand.WriteFile(wc24::kWc24SendMbx, mbx.data(), static_cast<uint32_t>(mbx.size()))) {
+        LOG("outbox: FAILED writing the send mailbox");
+        return false;
+    }
+    if (!nand.WriteFile(wc24::kWc24SendCtl, ctl.data(), static_cast<uint32_t>(ctl.size()))) {
+        LOG("outbox: FAILED writing the send index");
+        return false;
+    }
+    return true;
+}
+
 }  // namespace mail

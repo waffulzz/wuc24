@@ -46,4 +46,13 @@ bool Check(const msgcfg::Config &cfg, CheckResult &out);
 // console stores. THIS CONSUMES THE MAIL on the server.
 bool Receive(const msgcfg::Config &cfg, std::vector<std::string> &out_messages);
 
+// Hands queued messages to the server. send.cgi differs from the others: it
+// takes multipart/form-data, the credentials arrive as one combined "mlid"
+// field, and each message is a part named m0..m15 (16 at most). Results come
+// back per message as cd<N>/msg<N>.
+//
+// out_accepted is sized to match `messages`, true where the server took it.
+bool Send(const msgcfg::Config &cfg, const std::vector<std::string> &messages,
+          std::vector<bool> &out_accepted);
+
 }  // namespace mailfetch

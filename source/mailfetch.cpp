@@ -196,4 +196,68 @@ bool Receive(const msgcfg::Config &cfg, std::vector<std::string> &out_messages) 
     return true;
 }
 
+bool Send(const msgcfg::Config &cfg, const std::vector<std::string> &messages,
+          std::vector<bool> &out_accepted) {
+    out_accepted.assign(messages.size(), false);
+    if (messages.empty()) return true;
+
+    const std::string url = cfg.urls[msgcfg::URL_SEND];
+    if (url.empty()) {
+        LOG("mailsend: no send URL in the config");
+        return false;
+    }
+    if (cfg.password.empty()) {
+        LOG("mailsend: this console has no mail password");
+        return false;
+    }
+    if (messages.size() > 16) {
+        LOG("mailsend: %zu messages queued, the server accepts 16 at a time",
+            messages.size());
+        return false;
+    }
+
+    // Both credentials travel in a single field whose value is itself two
+    // "key=value" lines -- not two separate form fields.
+    std::vector<std::pair<std::string, std::string>> parts;
+    parts.emplace_back("mlid", "mlid=" + MailId(cfg) + "\npasswd=" + cfg.password);
+
+    for (size_t i = 0; i < messages.size(); i++) {
+        char name[8];
+        std::snprintf(name, sizeof(name), "m%zu", i);
+        parts.emplace_back(name, messages[i]);
+    }
+
+    std::vector<uint8_t> body;
+    int                  status = 0;
+    if (!net::HttpPostMultipart(url, parts, body, status)) return false;
+    if (status != 200) {
+        LOG("mailsend: HTTP %d", status);
+        return false;
+    }
+
+    const CgiResponse cgi = ParseCgi(std::string(body.begin(), body.end()));
+    LOG("mailsend: cd=%d (%s)", cgi.code, cgi.message.c_str());
+    if (cgi.code != 100) return false;
+
+    // Per-message results. A missing cd<N> means the server raised no
+    // objection to that one.
+    for (size_t i = 0; i < messages.size(); i++) {
+        char key[8];
+        std::snprintf(key, sizeof(key), "cd%zu", i);
+        const std::string code = cgi.Get(key);
+
+        char msg_key[8];
+        std::snprintf(msg_key, sizeof(msg_key), "msg%zu", i);
+
+        if (code.empty() || std::atoi(code.c_str()) == 100) {
+            out_accepted[i] = true;
+            LOG("mailsend: message %zu accepted", i);
+        } else {
+            LOG("mailsend: message %zu rejected -- %s (%s)", i, code.c_str(),
+                cgi.Get(msg_key).c_str());
+        }
+    }
+    return true;
+}
+
 }  // namespace mailfetch
