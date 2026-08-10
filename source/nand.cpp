@@ -137,6 +137,16 @@ bool VwiiNand::ReadFile(const char *vwii_path, std::vector<uint8_t> &out) {
     return true;
 }
 
+bool VwiiNand::Flush() {
+    if (!m_ready) return false;
+    const FSError err = FSAFlushVolume(m_client, kMountPath);
+    if (err != FS_ERROR_OK) {
+        LOG("flush failed: %s", FSAGetStatusStr(err));
+        return false;
+    }
+    return true;
+}
+
 bool VwiiNand::CopyFileTo(const char *vwii_path, FILE *dest) {
     if (!m_ready || !dest) return false;
 

@@ -20,10 +20,14 @@
 #include <exception>
 #include <vector>
 
+#include <coreinit/title.h>
+
 #include <wups.h>
 #include <wups/config_api.h>
 #include <wups/config/WUPSConfigItemBoolean.h>
 
+#include "autorun.h"
+#include "guard.h"
 #include "log.h"
 #include "mail.h"
 #include "mailfetch.h"
@@ -31,6 +35,7 @@
 #include "nand.h"
 #include "net.h"
 #include "tasks.h"
+#include "toast.h"
 #include "vff.h"
 #include "wc24.h"
 #include "wc24dec.h"
@@ -384,8 +389,12 @@ static void RestoreContainer(VwiiNand &nand, const ContainerJob &job) {
         LOG("  RESTORE FAILED: cannot read %s from SD", job.backup_name.c_str());
         return;
     }
+    // Putting the original back is the one write that must not be abandoned:
+    // it runs precisely when a container is already in doubt.
+    guard::CriticalSection critical;
     if (nand.WriteFile(job.vff_path.c_str(), backup.data(),
                        static_cast<uint32_t>(backup.size()))) {
+        nand.Flush();
         LOG("  original restored from %s", job.backup_name.c_str());
     } else {
         LOG("  RESTORE FAILED. The backup is still on SD as %s", job.backup_name.c_str());
@@ -409,7 +418,7 @@ static void RunPipeline(bool commit) {
     const char *mode = commit ? "COMMIT" : "dry run";
     LOG("=== %s ===", mode);
 
-    if (commit && !s_armed) {
+    if (commit && !s_armed && !autorun::Running()) {
         LOG("refusing to write: enable \"Arm NAND write\" first");
         return;
     }
@@ -451,6 +460,7 @@ static void RunPipeline(bool commit) {
             continue;
         }
         const size_t container_size = buffer.size();
+        const std::vector<uint8_t> original_bytes = buffer;
         LOG("  container is %zu bytes", container_size);
         {
             vff::Image image(buffer);
@@ -581,11 +591,43 @@ static void RunPipeline(bool commit) {
         }
 
         // 5. write it back, then read it straight off NAND to confirm
+        //
+        // Nothing so far has touched the console, so stopping here costs
+        // nothing. Once the write starts it has to finish, so this is the last
+        // point where quitting is free -- and the right place to check.
+        if (guard::StopRequested()) {
+            LOG("  stopping before the write: the console is on its way out");
+            LOG("  nothing was modified");
+            containers_failed++;
+            break;
+        }
+
+        // An identical container is not worth the risk of writing.
+        if (buffer == original_bytes) {
+            LOG("  unchanged -- skipping the write");
+            containers_ok++;
+            continue;
+        }
+
+        if (!guard::OpenJournal(job.vff_path, job.backup_name)) {
+            LOG("  refusing to write without a recovery journal");
+            containers_failed++;
+            continue;
+        }
+
         LOG("  writing %zu bytes to NAND ...", buffer.size());
-        if (!nand.WriteFile(job.vff_path.c_str(), buffer.data(),
-                            static_cast<uint32_t>(buffer.size()))) {
+        bool write_ok;
+        {
+            // Exit handlers wait for this rather than killing us mid-write.
+            guard::CriticalSection critical;
+            write_ok = nand.WriteFile(job.vff_path.c_str(), buffer.data(),
+                                      static_cast<uint32_t>(buffer.size()));
+            if (write_ok) nand.Flush();
+        }
+        if (!write_ok) {
             LOG("  WRITE FAILED -- restoring the original");
             RestoreContainer(nand, job);
+            guard::CloseJournal();
             containers_failed++;
             continue;
         }
@@ -599,6 +641,7 @@ static void RunPipeline(bool commit) {
         if (!nand.ReadFile(job.vff_path.c_str(), verify)) {
             LOG("  VERIFICATION FAILED: cannot read the container back -- restoring");
             RestoreContainer(nand, job);
+            guard::CloseJournal();
             containers_failed++;
             continue;
         }
@@ -610,6 +653,8 @@ static void RunPipeline(bool commit) {
             continue;
         }
 
+        // Verified, so the write is no longer something to recover from.
+        guard::CloseJournal();
         LOG("  COMMITTED and verified byte-for-byte (backup: %s)", job.backup_name.c_str());
         containers_ok++;
     }
@@ -731,7 +776,7 @@ static void RunMailCheck() {
 static void RunFetchMail(bool commit) {
     LOG("=== fetch mail (%s) ===", commit ? "COMMIT" : "dry run");
 
-    if (!s_armed) {
+    if (!s_armed && !autorun::Running()) {
         LOG("refusing: enable \"Arm NAND write\" first.");
         LOG("note: fetching consumes mail server-side even without writing.");
         return;
@@ -814,7 +859,7 @@ static void RunFetchMail(bool commit) {
 static void RunSendMail(bool commit) {
     LOG("=== send mail (%s) ===", commit ? "COMMIT" : "dry run");
 
-    if (commit && !s_armed) {
+    if (commit && !s_armed && !autorun::Running()) {
         LOG("refusing to write: enable \"Arm NAND write\" first");
         return;
     }
@@ -1424,6 +1469,77 @@ static void RunRestore() {
 }
 
 // ---------------------------------------------------------------------------
+// The automatic job
+// ---------------------------------------------------------------------------
+
+// Run everything on its own when a title starts. Off by default: it writes to
+// NAND, which should be a decision, not a surprise.
+static bool s_autorun = false;
+
+// Whether to hand queued mail to the server, and to pull down waiting mail.
+static bool s_autoMail = true;
+
+// The Wii U Menu, by region. The job only runs here: kicking off several
+// megabytes of downloads because someone launched a game would be rude, and the
+// Menu is where the console sits idle anyway.
+static bool IsWiiUMenu() {
+    const uint64_t title = OSGetTitleID();
+    return title == 0x0005001010040000ULL ||  // JPN
+           title == 0x0005001010040100ULL ||  // USA
+           title == 0x0005001010040200ULL;    // EUR
+}
+
+// The whole job, start to finish, on the background thread.
+//
+// Ordering is deliberate. Recovery comes first, so a container left half-written
+// by a previous run is repaired before anything else touches NAND. Sending goes
+// before fetching so a reply written on the console goes out even if the fetch
+// later fails. Channels come last because they are by far the longest part, and
+// by then the quick wins are already saved.
+static void AutorunJob() {
+    LOG("=== automatic run ===");
+    toast::Progress progress("WiiConnect24: starting");
+
+    {
+        VwiiNand nand;
+        if (!nand.ok()) {
+            progress.Finish("WiiConnect24: vWii NAND unavailable", true);
+            return;
+        }
+        if (guard::RecoverIfNeeded(nand)) {
+            toast::Info("WiiConnect24: repaired an interrupted write");
+        }
+    }
+
+    net::Init();
+
+    if (s_autoMail && !guard::StopRequested()) {
+        progress.Update("WiiConnect24: sending mail");
+        RunSendMail(true);
+    }
+    if (s_autoMail && !guard::StopRequested()) {
+        progress.Update("WiiConnect24: checking mail");
+        RunFetchMail(true);
+    }
+
+    if (guard::StopRequested()) {
+        progress.Finish("WiiConnect24: stopped");
+        LOG("=== automatic run stopped early ===");
+        return;
+    }
+
+    progress.Update("WiiConnect24: updating channels");
+    RunPipeline(true);
+
+    if (guard::StopRequested()) {
+        progress.Finish("WiiConnect24: stopped, nothing left half-written");
+    } else {
+        progress.Finish("WiiConnect24: up to date");
+    }
+    LOG("=== automatic run done ===");
+}
+
+// ---------------------------------------------------------------------------
 // Config menu
 // ---------------------------------------------------------------------------
 
@@ -1455,6 +1571,17 @@ static void OnDryRunToggled(ConfigItemBoolean * /*item*/, bool newValue) {
 
 // Persisted, unlike the action toggles: arming is meant to be a deliberate
 // separate step from triggering the write.
+static void OnAutorunToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    s_autorun = newValue;
+    WUPSStorageAPI::Store("autorun", s_autorun);
+    LOG("autorun %s", s_autorun ? "ENABLED" : "disabled");
+}
+
+static void OnAutoMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
+    s_autoMail = newValue;
+    WUPSStorageAPI::Store("automail", s_autoMail);
+}
+
 static void OnArmToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     s_armed = newValue;
     WUPSStorageAPI::Store("armed", s_armed);
@@ -1558,6 +1685,14 @@ static void OnRestoreToggled(ConfigItemBoolean * /*item*/, bool newValue) {
 }
 
 static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHandle root) {
+    // The automatic behaviour comes first: it is what most people want, and
+    // everything below it is a manual tool.
+    WUPSConfigItemBoolean_AddToCategory(
+        root, "autorun", "Update automatically at boot (writes to vWii NAND)",
+        false, s_autorun, &OnAutorunToggled);
+    WUPSConfigItemBoolean_AddToCategory(
+        root, "automail", "  ...including sending and receiving mail",
+        true, s_autoMail, &OnAutoMailToggled);
     WUPSConfigItemBoolean_AddToCategory(
         root, "scan", "Scan vWii WC24 tasks (read-only) — toggle ON + close menu",
         false, false, &OnScanToggled);
@@ -1595,7 +1730,7 @@ static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHa
         root, "dry_run", "DRY RUN: download + update all containers -> SD only (no NAND write)",
         false, false, &OnDryRunToggled);
     WUPSConfigItemBoolean_AddToCategory(
-        root, "armed", "Arm NAND write (required by the three actions below)",
+        root, "armed", "Arm NAND write (required by the manual write actions)",
         false, s_armed, &OnArmToggled);
     WUPSConfigItemBoolean_AddToCategory(
         root, "commit", "COMMIT: download + write all containers to vWii NAND",
@@ -1637,6 +1772,8 @@ INITIALIZE_PLUGIN() {
     net::Init();
 
     WUPSStorageAPI::GetOrStoreDefault("armed", s_armed, false);
+    WUPSStorageAPI::GetOrStoreDefault("autorun", s_autorun, false);
+    WUPSStorageAPI::GetOrStoreDefault("automail", s_autoMail, true);
     WUPSStorageAPI::GetOrStoreDefault("wiilink_dns", s_useWiiLinkDns, false);
     net::SetDnsServer(s_useWiiLinkDns ? net::kWiiLinkDns : nullptr);
 
@@ -1649,6 +1786,34 @@ INITIALIZE_PLUGIN() {
 }
 
 DEINITIALIZE_PLUGIN() {
+    autorun::Stop(5000);
+    toast::Shutdown();
     LOG("wuc24 deinitialised");
     LogDeinit();
+}
+
+ON_APPLICATION_START() {
+    LogInit();
+    net::Init();
+    toast::Init();
+
+    if (!s_autorun) return;
+    if (!IsWiiUMenu()) {
+        LOG("autorun: not the Wii U Menu, staying out of the way");
+        return;
+    }
+    LOG("autorun: starting the background job");
+    autorun::Start(&AutorunJob);
+}
+
+// The title is going away -- the user launched vWii, started a game, or is
+// shutting down. Ask the job to stop and give a write in flight time to land.
+ON_APPLICATION_REQUESTS_EXIT() {
+    if (autorun::Running()) LOG("autorun: exit requested, winding up");
+    autorun::Stop(5000);
+}
+
+ON_APPLICATION_ENDS() {
+    autorun::Stop(5000);
+    toast::Shutdown();
 }

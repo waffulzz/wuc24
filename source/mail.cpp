@@ -4,6 +4,7 @@
 #include <cstring>
 #include <ctime>
 
+#include "guard.h"
 #include "log.h"
 #include "nand.h"
 #include "vff.h"
@@ -157,14 +158,40 @@ bool DeliverRaw(VwiiNand &nand, const std::string &text, bool commit) {
     }
 
     // --- write both files back ---------------------------------------------
-    if (!nand.WriteFile(wc24::kWc24RecvMbx, mbx.data(), static_cast<uint32_t>(mbx.size()))) {
-        LOG("mail: FAILED writing the mailbox -- inbox index left untouched");
+    //
+    // Last point at which stopping is free.
+    if (guard::StopRequested()) {
+        LOG("mail: stopping before the write; nothing was modified");
         return false;
     }
-    if (!nand.WriteFile(wc24::kWc24RecvCtl, ctl.data(), static_cast<uint32_t>(ctl.size()))) {
-        LOG("mail: FAILED writing the index; the mailbox now holds an orphaned message");
-        LOG("mail: restore both files from the SD backups");
-        return false;
+
+    // The mailbox goes first. Interrupted between the two, that leaves a
+    // message body nothing points at -- wasted space, but harmless. The other
+    // order would leave the index referring to a message that is not there.
+    {
+        guard::CriticalSection critical;
+        if (!guard::OpenJournal(wc24::kWc24RecvMbx, "wuc24_bak_recv_mbx.bin")) return false;
+        const bool ok =
+            nand.WriteFile(wc24::kWc24RecvMbx, mbx.data(), static_cast<uint32_t>(mbx.size()));
+        if (ok) nand.Flush();
+        guard::CloseJournal();
+        if (!ok) {
+            LOG("mail: FAILED writing the mailbox -- inbox index left untouched");
+            return false;
+        }
+    }
+    {
+        guard::CriticalSection critical;
+        if (!guard::OpenJournal(wc24::kWc24RecvCtl, "wuc24_bak_recv_ctl.bin")) return false;
+        const bool ok =
+            nand.WriteFile(wc24::kWc24RecvCtl, ctl.data(), static_cast<uint32_t>(ctl.size()));
+        if (ok) nand.Flush();
+        guard::CloseJournal();
+        if (!ok) {
+            LOG("mail: FAILED writing the index; the mailbox holds an orphaned message");
+            LOG("mail: restore both files from the SD backups");
+            return false;
+        }
     }
 
     // --- read it straight back --------------------------------------------
@@ -331,13 +358,33 @@ bool ClearFromOutbox(VwiiNand &nand, const std::vector<Queued> &sent, bool commi
         return true;
     }
 
-    if (!nand.WriteFile(wc24::kWc24SendMbx, mbx.data(), static_cast<uint32_t>(mbx.size()))) {
-        LOG("outbox: FAILED writing the send mailbox");
-        return false;
+    // The server already has these messages, so the console must forget them or
+    // it will send them again. That makes finishing more important than
+    // stopping promptly -- hence no StopRequested() check here, only the
+    // critical section that asks an exit to wait for us.
+    {
+        guard::CriticalSection critical;
+        if (!guard::OpenJournal(wc24::kWc24SendMbx, "wuc24_bak_send_mbx.bin")) return false;
+        const bool ok =
+            nand.WriteFile(wc24::kWc24SendMbx, mbx.data(), static_cast<uint32_t>(mbx.size()));
+        if (ok) nand.Flush();
+        guard::CloseJournal();
+        if (!ok) {
+            LOG("outbox: FAILED writing the send mailbox");
+            return false;
+        }
     }
-    if (!nand.WriteFile(wc24::kWc24SendCtl, ctl.data(), static_cast<uint32_t>(ctl.size()))) {
-        LOG("outbox: FAILED writing the send index");
-        return false;
+    {
+        guard::CriticalSection critical;
+        if (!guard::OpenJournal(wc24::kWc24SendCtl, "wuc24_bak_send_ctl.bin")) return false;
+        const bool ok =
+            nand.WriteFile(wc24::kWc24SendCtl, ctl.data(), static_cast<uint32_t>(ctl.size()));
+        if (ok) nand.Flush();
+        guard::CloseJournal();
+        if (!ok) {
+            LOG("outbox: FAILED writing the send index");
+            return false;
+        }
     }
     return true;
 }

@@ -57,6 +57,10 @@ public:
     // Lists a directory on the vWii NAND.
     bool ListDir(const char *vwii_path, std::vector<DirEntry> &out);
 
+    // Pushes anything still buffered out to the medium. Called right after a
+    // write so a write that "succeeded" is actually on NAND before we move on.
+    bool Flush();
+
 private:
     std::string FullPath(const char *vwii_path) const;
 

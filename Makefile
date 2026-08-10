@@ -38,7 +38,7 @@ ASFLAGS  := $(ARCH)
 LDFLAGS   = $(ARCH) $(RPXSPECS) -Wl,-Map,$(notdir $*.map) $(WUPSSPECS)
 
 # -lmocha : vWii NAND (slccmpt) access from Wii U mode
-LIBS := -lmocha -lwups -lwut
+LIBS := -lnotifications -lmocha -lwups -lwut
 
 #-------------------------------------------------------------------------------
 # top-level library dirs (each must contain include/ and lib/)
