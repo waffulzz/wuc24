@@ -848,6 +848,24 @@ static void RunSendMail(bool commit) {
         SaveToSd(name, queued[i].text.data(), queued[i].text.size());
     }
 
+    // Stop here on a dry run, BEFORE going near the network.
+    //
+    // Handing the message to the server delivers it for real; skipping only
+    // the NAND write afterwards would still send it, and running the dry run
+    // and then the commit would deliver it twice. The recipient cannot be
+    // un-sent to, so the safe half of this action is the half that never
+    // opens a socket.
+    if (!commit) {
+        LOG("dry run: %zu message(s) would be sent. Nothing has been transmitted.",
+            queued.size());
+        for (const auto &q : queued) {
+            LOG("  slot %u id %u, %zu bytes", q.slot, q.id, q.text.size());
+        }
+        LOG("copies of each are on SD as wuc24_outbox_NN.msg");
+        LOG("=== send mail done ===");
+        return;
+    }
+
     std::vector<uint8_t> backup;
     if (!nand.ReadFile(wc24::kWc24SendCtl, backup) ||
         !SaveToSd("wuc24_bak_send_ctl.bin", backup.data(), backup.size())) {
@@ -1586,7 +1604,7 @@ static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHa
         root, "clear", "CLEAR: delete WC24 data from the containers (for testing)",
         false, false, &OnClearToggled);
     WUPSConfigItemBoolean_AddToCategory(
-        root, "send_dry", "SEND MAIL (dry run): show what is queued, send nothing",
+        root, "send_dry", "SEND MAIL (dry run): list the outbox, no network at all",
         false, false, &OnSendMailDryToggled);
     WUPSConfigItemBoolean_AddToCategory(
         root, "send_mail", "SEND MAIL: send queued outbox mail (needs arming)",
