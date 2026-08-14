@@ -1086,9 +1086,10 @@ static void RunRestore() {
 // The automatic job
 // ---------------------------------------------------------------------------
 
-// Run everything on its own when a title starts. Off by default: it writes to
-// NAND, which should be a decision, not a surprise.
-static bool s_autorun = false;
+// Run everything on its own when a title starts. On by default: keeping the
+// channels current without being asked is the whole point of installing this,
+// and the writes are backed up and journalled either way.
+static bool s_autorun = true;
 
 // Whether to hand queued mail to the server, and to pull down waiting mail.
 static bool s_autoMail = true;
@@ -1273,7 +1274,7 @@ static void OnChannelToggled(ConfigItemBoolean *item, bool newValue) {
 static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHandle root) {
     // What the plugin is for comes first; everything else is a tool.
     WUPSConfigItemBoolean_AddToCategory(
-        root, "autorun", "Update at boot", false, s_autorun, &OnAutorunToggled);
+        root, "autorun", "Update at boot", true, s_autorun, &OnAutorunToggled);
     WUPSConfigItemBoolean_AddToCategory(
         root, "automail", "Include mail (send and receive)", true, s_autoMail,
         &OnAutoMailToggled);
@@ -1326,7 +1327,7 @@ INITIALIZE_PLUGIN() {
     LogInit();
     net::Init();
 
-    WUPSStorageAPI::GetOrStoreDefault("autorun", s_autorun, false);
+    WUPSStorageAPI::GetOrStoreDefault("autorun", s_autorun, true);
     WUPSStorageAPI::GetOrStoreDefault("automail", s_autoMail, true);
     WUPSStorageAPI::GetOrStoreDefault("last_run", s_lastRun, static_cast<int64_t>(0));
     for (auto &c : s_channels) {
