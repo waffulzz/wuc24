@@ -42,7 +42,7 @@
 WUPS_PLUGIN_NAME("wuc24");
 WUPS_PLUGIN_DESCRIPTION("Download WiiConnect24 (WiiLink) content to the vWii from Wii U mode");
 WUPS_PLUGIN_VERSION("v0.1-dev");
-WUPS_PLUGIN_AUTHOR("anonymous");
+WUPS_PLUGIN_AUTHOR("waffulzz");
 WUPS_PLUGIN_LICENSE("GPLv2");
 
 WUPS_USE_WUT_DEVOPTAB();
@@ -241,24 +241,70 @@ struct ContainerJob {
 
 // The four-character title code is the only name we have for a channel, and it
 // means nothing to anyone reading a notification.
+// The channels this knows by name, and whether each one is wanted.
+//
+// Matching is on the first three characters because the fourth is the region:
+// HAGE, HAGJ and HAGP are all the News Channel.
+//
+// Being able to turn one off matters more than it sounds. The News Channel is
+// 24 separate files and a few megabytes, where every other channel is one or
+// two small ones -- it accounts for most of the time a run takes, and not
+// everybody reads it.
+struct Channel {
+    const char *prefix;  // first three characters of the title code
+    const char *name;    // what to call it in the log
+    const char *menu;    // what to call it in the settings menu
+    const char *key;     // where its setting lives in plugin storage
+    bool        enabled;
+};
+
+static Channel s_channels[] = {
+    {"HAF", "Forecast",          "Forecast",                    "ch_forecast", true},
+    {"HAG", "News",              "News  (slow: 24 files)",      "ch_news",     true},
+    {"HAJ", "Everybody Votes",   "Everybody Votes",             "ch_votes",    true},
+    {"HAT", "Nintendo Channel",  "Nintendo Channel",            "ch_nintendo", true},
+    {"HAB", "Wii Shop",          "Wii Shop",                    "ch_shop",     true},
+    {"RZT", "Wii Sports Resort", "Wii Sports Resort",           "ch_wsr",      true},
+    {"RMC", "Mario Kart Wii",    "Mario Kart Wii  (needs TLS)", "ch_mkw",      true},
+};
+
+// The entry for a task, or null if it is a channel we have no name for.
+static Channel *FindChannel(const DlTaskInfo &t) {
+    for (auto &c : s_channels) {
+        if (t.high_title_id.compare(0, 3, c.prefix) == 0) return &c;
+    }
+    return nullptr;
+}
+
 static std::string ChannelLabel(const DlTaskInfo &t) {
-    if (t.high_title_id == "HAFE" || t.high_title_id == "HAFA") return "Forecast";
-    if (t.high_title_id == "HAGE" || t.high_title_id == "HAGA") return "News";
-    if (t.high_title_id == "HAJE" || t.high_title_id == "HAJA") return "Everybody Votes";
-    if (t.high_title_id == "HATE" || t.high_title_id == "HATA") return "Nintendo Channel";
-    if (t.high_title_id == "HABA") return "Wii Shop";
-    if (t.high_title_id == "RZTE") return "Wii Sports Resort";
-    if (t.high_title_id == "RMCE") return "Mario Kart Wii";
-    return t.high_title_id;
+    const Channel *c = FindChannel(t);
+    return c ? c->name : t.high_title_id;
+}
+
+// Unknown channels are left enabled: there is no toggle for them, so refusing
+// to update them would be a setting nobody could find or change.
+static bool ChannelEnabled(const DlTaskInfo &t) {
+    const Channel *c = FindChannel(t);
+    return c ? c->enabled : true;
 }
 
 // Collects the containers to update and the files destined for each.
+// `skip_disabled` is what the settings menu controls. Restore passes false:
+// turning a channel off means "do not spend time downloading it", not "leave it
+// broken", so a recovery still covers everything there is a backup for.
 static void BuildJobs(const std::vector<DlTaskInfo> &tasks, std::vector<ContainerJob> &jobs,
-                      bool log_skips) {
+                      bool log_skips, bool skip_disabled = true) {
     for (const auto &t : tasks) {
         const char *why_not = nullptr;
         if (!IsEligible(t, &why_not)) {
             if (log_skips) LOG("skipping [%u] %s: %s", t.index, t.filename.c_str(), why_not);
+            continue;
+        }
+        if (skip_disabled && !ChannelEnabled(t)) {
+            if (log_skips) {
+                LOG("skipping [%u] %s: %s is turned off", t.index, t.filename.c_str(),
+                    ChannelLabel(t).c_str());
+            }
             continue;
         }
 
@@ -1014,7 +1060,7 @@ static void RunRestore() {
     }
 
     std::vector<ContainerJob> jobs;
-    BuildJobs(tasks, jobs, false);
+    BuildJobs(tasks, jobs, false, /*skip_disabled=*/false);
 
     for (const auto &job : jobs) {
         std::vector<uint8_t> backup;
@@ -1210,6 +1256,20 @@ static void OnDumpMailToggled(ConfigItemBoolean * /*item*/, bool newValue) {
     }
 }
 
+// Every channel toggle shares this; the item carries its own identifier, which
+// is also its storage key.
+static void OnChannelToggled(ConfigItemBoolean *item, bool newValue) {
+    if (!item || !item->identifier) return;
+    for (auto &c : s_channels) {
+        if (std::strcmp(item->identifier, c.key) == 0) {
+            c.enabled = newValue;
+            WUPSStorageAPI::Store(c.key, c.enabled);
+            LOG("channel %s %s", c.name, c.enabled ? "enabled" : "skipped");
+            return;
+        }
+    }
+}
+
 static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHandle root) {
     // What the plugin is for comes first; everything else is a tool.
     WUPSConfigItemBoolean_AddToCategory(
@@ -1221,6 +1281,19 @@ static WUPSConfigAPICallbackStatus ConfigMenuOpenedCallback(WUPSConfigCategoryHa
         root, "run_now", "Update now", false, false, &OnRunNowToggled);
     WUPSConfigItemBoolean_AddToCategory(
         root, "restore", "Restore from SD backups", false, false, &OnRestoreToggled);
+
+    // Which channels to bother with. News is singled out because it dominates
+    // how long a run takes and is the one people are most likely to drop.
+    WUPSConfigCategoryHandle channels;
+    WUPSConfigAPICreateCategoryOptionsV1 channel_options = {.name = "Channels"};
+    if (WUPSConfigAPI_Category_Create(channel_options, &channels) ==
+        WUPSCONFIG_API_RESULT_SUCCESS) {
+        for (const auto &c : s_channels) {
+            WUPSConfigItemBoolean_AddToCategory(channels, c.key, c.menu, true, c.enabled,
+                                                &OnChannelToggled);
+        }
+        WUPSConfigAPI_Category_AddCategory(root, channels);
+    }
 
     // Read-only tools, tucked away. They exist so that "it did not work" can be
     // answered with evidence rather than guesswork.
@@ -1256,6 +1329,9 @@ INITIALIZE_PLUGIN() {
     WUPSStorageAPI::GetOrStoreDefault("autorun", s_autorun, false);
     WUPSStorageAPI::GetOrStoreDefault("automail", s_autoMail, true);
     WUPSStorageAPI::GetOrStoreDefault("last_run", s_lastRun, static_cast<int64_t>(0));
+    for (auto &c : s_channels) {
+        WUPSStorageAPI::GetOrStoreDefault(c.key, c.enabled, true);
+    }
 
     // The console's own resolver handles every host we actually use; stale
     // Nintendo hostnames are dealt with by kHostOverrides instead.
