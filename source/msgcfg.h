@@ -1,3 +1,5 @@
+// Portions derived from the Dolphin Emulator Project (GPL-2.0-or-later):
+// the nwc24msg.cfg layout.
 // msgcfg.h — /shared2/wc24/nwc24msg.cfg, the console's mail identity.
 //
 // Holds the console's WiiConnect24 id (its "Wii number"), its own mail

@@ -1,3 +1,4 @@
+// Portions derived from the Dolphin Emulator Project (GPL-2.0-or-later).
 // vff.h — read/write files inside a WiiConnect24 VFF container.
 //
 // A VFF ("virtual FAT file") is a 32-byte big-endian header followed by a

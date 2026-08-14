@@ -1,3 +1,5 @@
+// Portions derived from the Dolphin Emulator Project (GPL-2.0-or-later):
+// the nwc24msg.cfg layout and its checksum.
 #include "msgcfg.h"
 
 #include <cstdio>

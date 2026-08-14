@@ -1,3 +1,5 @@
+// Portions derived from the Dolphin Emulator Project (GPL-2.0-or-later):
+// the nwc24dl.bin, WC24File, mail list and VFF header layouts.
 // wc24.h — WiiConnect24 on-NAND file formats.
 //
 // These structs describe files stored in the vWii NAND under /shared2/wc24/.

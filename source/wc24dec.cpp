@@ -1,3 +1,5 @@
+// Portions derived from the Dolphin Emulator Project (GPL-2.0-or-later):
+// the 320-byte header strip and AES-OFB decryption of WC24 downloads.
 #include "wc24dec.h"
 
 #include <cstring>

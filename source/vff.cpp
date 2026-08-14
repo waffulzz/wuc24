@@ -1,3 +1,5 @@
+// Portions derived from the Dolphin Emulator Project (GPL-2.0-or-later):
+// the hand-populated FATFS state and the -480 byte sector skew.
 #include "vff.h"
 
 #include <cstring>
