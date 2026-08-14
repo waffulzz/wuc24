@@ -1,0 +1,117 @@
+name: build
+
+# Dev builds on every push and pull request, uploaded as artifacts.
+# Pushing a v* tag builds the same way but without the -dev suffix, and
+# publishes the result as a release.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The parts that do not need a Wii U toolchain. These run against real
+  # captured data and published test vectors, so a failure here is a real
+  # regression, not a build problem.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AES (FIPS-197 and SP 800-38A vectors)
+        run: |
+          g++ -std=gnu++20 -fsanitize=address,undefined -I source \
+              -o /tmp/aes_test tools/aes_test.cpp source/aes.cpp
+          /tmp/aes_test
+
+      - name: DNS
+        run: |
+          g++ -std=gnu++20 -fsanitize=address,undefined -I source \
+              -o /tmp/dns_test tools/dns_test.cpp source/dns.cpp
+          /tmp/dns_test
+
+      - name: Mail message building and parsing
+        run: |
+          g++ -std=gnu++20 -fsanitize=address,undefined -I source \
+              -o /tmp/mail_test tools/mail_test.cpp source/mailmsg.cpp
+          /tmp/mail_test
+
+      # Needs a VFF image and a raw download to run against, which are console
+      # dumps and are not in the repository. Compiling it still catches the
+      # breakage a change to vff.cpp would cause.
+      - name: VFF (compile only)
+        run: |
+          g++ -std=gnu++20 -I source -I third_party/fatfs \
+              -o /tmp/vff_test tools/vff_test.cpp source/vff.cpp \
+              third_party/fatfs/ff.c third_party/fatfs/ffunicode.c
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      version: ${{ steps.version.outputs.string }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "release=1" >> "$GITHUB_OUTPUT"
+            echo "string=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            rev="$(git rev-parse --short=7 HEAD)"
+            echo "release=0" >> "$GITHUB_OUTPUT"
+            echo "string=dev+${rev}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Built from the repository's own Dockerfile rather than a hand-copied
+      # list of images, so CI and a local build use the same pinned toolchain.
+      - name: Build the toolchain image
+        run: docker build -t wuc24-builder .
+
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD":/project \
+            -e RELEASE=${{ steps.version.outputs.release }} \
+            -e GIT_REV=$(git rev-parse --short=7 HEAD) \
+            wuc24-builder make
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wuc24-${{ steps.version.outputs.string }}
+          path: wuc24.wps
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wuc24-${{ needs.build.outputs.version }}
+
+      - name: Write the release notes
+        run: |
+          cat > notes.md <<'EOF'
+          Copy `wuc24.wps` to `sd:/wiiu/environments/aroma/plugins/`.
+
+          Requires Aroma, and a vWii already set up for WiiLink — this reads the
+          download list the console already has, it does not create one.
+
+          It writes to the vWii NAND. Every container is backed up to SD first,
+          and **Restore from SD backups** in the plugin settings puts them back.
+          EOF
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" wuc24.wps --title "$tag" --notes-file notes.md

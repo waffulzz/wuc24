@@ -25,12 +25,36 @@ DATA     := data
 INCLUDES := source third_party/fatfs
 
 #-------------------------------------------------------------------------------
+# version
+#
+# Builds are marked -dev unless RELEASE=1, which the tag workflow sets. Dev
+# builds also carry the commit they came from: they are handed out as CI
+# artifacts, which arrive with no other clue about their provenance, and the
+# version string is what Aroma shows in the plugin list.
+#
+# GIT_REV is overridable because the build usually runs inside a container where
+# the checkout is not git's to read. If it cannot be worked out, the suffix is
+# simply left off.
+#-------------------------------------------------------------------------------
+VERSION := 0.1
+GIT_REV ?= $(shell git rev-parse --short=7 HEAD 2>/dev/null)
+
+ifeq ($(RELEASE),1)
+    VERSION_STRING := v$(VERSION)
+else ifeq ($(strip $(GIT_REV)),)
+    VERSION_STRING := v$(VERSION)-dev
+else
+    VERSION_STRING := v$(VERSION)-dev+$(GIT_REV)
+endif
+
+#-------------------------------------------------------------------------------
 # code generation
 #-------------------------------------------------------------------------------
 CFLAGS   := -Wall -O2 -ffunction-sections \
             $(MACHDEP)
 
 CFLAGS   += $(INCLUDE) -D__WIIU__ -D__WUT__ -D__WUPS__
+CFLAGS   += -DWUC24_VERSION=\"$(VERSION_STRING)\"
 
 CXXFLAGS := $(CFLAGS) -std=gnu++20
 

@@ -41,7 +41,13 @@
 
 WUPS_PLUGIN_NAME("wuc24");
 WUPS_PLUGIN_DESCRIPTION("Download WiiConnect24 (WiiLink) content to the vWii from Wii U mode");
-WUPS_PLUGIN_VERSION("v0.1-dev");
+// Set by the Makefile, which stamps in the commit for dev builds. The fallback
+// is only reached if main.cpp is built outside it.
+#ifndef WUC24_VERSION
+#define WUC24_VERSION "v0.1-dev"
+#endif
+
+WUPS_PLUGIN_VERSION(WUC24_VERSION);
 WUPS_PLUGIN_AUTHOR("waffulzz");
 WUPS_PLUGIN_LICENSE("See THIRD-PARTY.md");
 
